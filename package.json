@@ -1,0 +1,25 @@
+{
+  "name": "temtie",
+  "version": "0.0.1",
+  "description": "Template calls that remember their place and update from there.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OEvgeny/temtie.git"
+  },
+  "bugs": {
+    "url": "https://github.com/OEvgeny/temtie/issues"
+  },
+  "homepage": "https://github.com/OEvgeny/temtie#readme",
+  "types": "./types.d.ts",
+  "files": [
+    "*.js",
+    "builder/*.js",
+    "types.d.ts"
+  ],
+  "sideEffects": false,
+  "devDependencies": {
+    "vite": "^8.0.8"
+  }
+}
