@@ -1,3 +1,4 @@
+/* ꙋ temtie · builder · dom.js */
 /** @import { Builder } from '../types.d.ts' */
 
 const SVG_NAMESPACE = 'http://www.w3.org/2000/svg';

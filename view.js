@@ -1,4 +1,4 @@
-/** temtie view — rendering surface over nodes. */
+/* ꙋ temtie · view.js */
 /** @import { Builders, DefaultBuilders, Define, View, RootWithBuilders } from './types.d.ts' */
 
 import { compileTemplate, TEMPLATE_HOLE_TYPES } from './parser.js';
@@ -92,14 +92,14 @@ class TemTieView {
     throw new Error('temtie/view: cannot update before mount()');
   }
 
-  mount(container, source = {}) {
+  mount(container, options = {}) {
     const pub = this, priv = this[PRIVATE];
-    priv.id = source.id ?? nextViewId++;
-    priv.builders = source.builders;
+    priv.id = options.id ?? nextViewId++;
+    priv.builders = options.builders;
     priv.roots = new WeakMap();
     priv.channels = new WeakMap();
     priv.turn = null;
-    priv.schedule = source.scheduleUpdate ?? createMicrotaskSchedule();
+    priv.schedule = options.scheduleUpdate ?? createMicrotaskSchedule();
     priv.rootHandlers = createTemplateHandlers({ next: renderNextTurn }, priv, createTemplateHandler);
     priv.slotHandlers = createTemplateHandlers({}, priv, createSlotChannelHandler);
     priv.root = rootHandle(priv, container);
