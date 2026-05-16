@@ -130,9 +130,8 @@ function createMicrotaskSchedule() {
 }
 
 function createTemplateHandlers(bag, viewRecord, createTemplateMethod) {
-  for (const channel of Object.keys(viewRecord.builders)) {
+  for (const channel of Object.keys(viewRecord.builders))
     bag[channel] = createTemplateMethod(channel, viewRecord.builders[channel]);
-  }
 
   return bag;
 }
@@ -143,12 +142,9 @@ function rootHandle(viewRecord, node) {
   let rootHandle = viewRecord.roots.get(node);
   if (rootHandle) return rootHandle;
 
-  rootHandle = Object.assign({
-    node,
-    [PRIVATE]: viewRecord,
-  }, viewRecord.rootHandlers);
-
+  rootHandle = Object.assign({ node, [PRIVATE]: viewRecord }, viewRecord.rootHandlers);
   viewRecord.roots.set(node, rootHandle);
+
   return rootHandle;
 }
 
@@ -157,6 +153,7 @@ function renderNextTurn(callback) {
 
   viewRecord.turn = turn;
   debug.enabled && debug.emit({ type: 'turn-start', viewId: viewRecord.id });
+
   try {
     callback();
   } finally {
@@ -252,9 +249,8 @@ function assertRange(builder, start, end) {
   if (start === end) return;
 
   const startParent = builder.parent(start), endParent = builder.parent(end);
-  if (startParent !== endParent) {
+  if (startParent !== endParent)
     throw new Error('temtie/view: invalid range handle: boundary nodes are not siblings');
-  }
 
   let node = start;
   while (node) {
@@ -421,9 +417,7 @@ function updateEntry(target, template, entry, values) {
       error,
     });
     const next = entry.rangeHandle?.end ? target.builder.next(entry.rangeHandle.end) : null;
-    if (target.cursor === entry.rangeHandle?.start) {
-      target.cursor = next;
-    }
+    if (target.cursor === entry.rangeHandle?.start) target.cursor = next;
     destroyEntry(entry);
     throw error;
   }
@@ -647,6 +641,15 @@ function createRange(target, template) {
     end = marker;
   }
 
+  let node = null;
+  if (start === end && builder.isContainer(start)) {
+    node = start;
+  } else {
+    let container = start;
+    while (container && !builder.isContainer(container)) container = builder.next(container);
+    if (container) node = container;
+  }
+
   const range = {
     target,
     builder,
@@ -654,7 +657,7 @@ function createRange(target, template) {
     fragment,
     start,
     end,
-    node: start === end && builder.isContainer(start) ? start : null,
+    node,
     bindings: null,
   };
   range.bindings = createBindings(range);
@@ -783,7 +786,7 @@ function applySlotBinding(range, binding, next, protocol) {
 
   if (!binding.target) {
     const container = range.builder.parent(binding.start);
-    if (!container) return undefined;
+    if (!container) return;
     binding.target = {
       viewRecord: range.target.viewRecord,
       container,
@@ -846,7 +849,7 @@ function disposeSlotBinding(binding) {
 
 function applyAttrBinding(range, binding, values) {
   const next = values[binding.index];
-  if (next === binding.prev) return undefined;
+  if (next === binding.prev) return;
   range.builder.setProp(binding.node, binding.prop, next);
   binding.prev = next;
 }
