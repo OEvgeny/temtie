@@ -7,6 +7,7 @@ declare const TEMTIE_VALUE: unique symbol;
 export interface Builder<Node = unknown, Root = Node> {
   createRoot(): Root;
   decodeStatic?(value: string, context?: 'text' | 'attr'): string;
+  isVoidElement?(tag: string): boolean;
   createElement(tag: string): Node;
   createText(text: string): Node;
   createMarker(): Node;

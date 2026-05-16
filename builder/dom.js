@@ -114,11 +114,10 @@ function setChild(startMarker, endMarker, value) {
   if (!parent) return;
 
   const first = startMarker.nextSibling,
-    isPrimitive =
-    value == null ||
-    typeof value === 'string' ||
-    typeof value === 'number' ||
-    typeof value === 'boolean';
+    isPrimitive = value == null ||
+      typeof value === 'string' ||
+      typeof value === 'number' ||
+      typeof value === 'boolean';
 
   if (isPrimitive) {
     const text = value == null || value === false ? '' : String(value);
@@ -147,6 +146,11 @@ function setChild(startMarker, endMarker, value) {
     this.remove(first, endMarker.previousSibling);
 
   parent.insertBefore(toNode(value), endMarker);
+}
+
+const VOID_ELEMENTS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
+function isVoidElement(tag) {
+  return VOID_ELEMENTS.has(tag.toLowerCase());
 }
 
 /** @type {Builder<Node, DocumentFragment>} */
@@ -264,6 +268,8 @@ export const DOMBuilder = {
     return node.previousSibling ?? null;
   },
 
+  isVoidElement,
+
   setChild,
 
   toNode,
@@ -276,6 +282,9 @@ export const DOMBuilder = {
 /** @type {Builder<Node, DocumentFragment>} */
 export const SVGBuilder = {
   ...DOMBuilder,
+  isVoidElement() {
+    return false;
+  },
   createElement(tag) {
     return getGlobalDocument().createElementNS(SVG_NAMESPACE, tag);
   },

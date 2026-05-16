@@ -40,6 +40,7 @@ export function parseTemplate(strings, builder) {
   const fragment = builder.createRoot(),
     holes = [],
     decodeStatic = builder.decodeStatic ?? (value => value),
+    isVoidElement = builder.isVoidElement ?? (() => false),
     stack = [{ node: fragment, path: [], childIndex: 0, tag: null }];
 
   let mode = TEMPLATE_PARSER_MODES.TEXT,
@@ -81,6 +82,8 @@ export function parseTemplate(strings, builder) {
   function commitPendingTag() {
     if (!pendingNode)
       throw new SyntaxError('temtie/parser syntax error: missing pending tag to commit');
+
+    if (isVoidElement(pendingTagName)) return commitSelfClosingTag();
 
     const ctx = stack.at(-1);
     builder.insert(ctx.node, pendingNode);
