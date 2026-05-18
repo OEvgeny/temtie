@@ -139,6 +139,8 @@ function createTemplateHandlers(bag, viewRecord, createTemplateMethod) {
 function rootHandle(viewRecord, node) {
   if (!node) throw new Error('temtie/view: unable to find parent container');
 
+  activateRootNode(viewRecord, node);
+
   let rootHandle = viewRecord.roots.get(node);
   if (rootHandle) return rootHandle;
 
@@ -148,10 +150,15 @@ function rootHandle(viewRecord, node) {
   return rootHandle;
 }
 
+function activateRootNode(viewRecord, node) {
+  if (viewRecord.turn && node) viewRecord.turn.roots.add(node);
+}
+
 function renderNextTurn(callback) {
-  const viewRecord = this[PRIVATE], previous = viewRecord.turn, turn = { channels: [] };
+  const viewRecord = this[PRIVATE], previous = viewRecord.turn, turn = { channels: [], roots: new Set(), viewRecord };
 
   viewRecord.turn = turn;
+  activateRootNode(viewRecord, this.node);
   debug.enabled && debug.emit({ type: 'turn-start', viewId: viewRecord.id });
 
   try {
@@ -163,16 +170,34 @@ function renderNextTurn(callback) {
 }
 
 function flushTurn(turn) {
+  beginSkippedRootChannels(turn);
+
   for (const channel of turn.channels) {
     flushTarget(channel.target, channel.target.round);
     channel.turn = null;
   }
 }
 
+function beginSkippedRootChannels(turn) {
+  for (const root of turn.roots) {
+    const byChannel = turn.viewRecord.channels.get(root);
+    if (!byChannel) continue;
+
+    for (const channel of byChannel.values()) {
+      if (channel.turn === turn) continue;
+      channel.turn = turn;
+      beginTarget(channel.target, ++channel.round);
+      turn.channels.push(channel);
+    }
+  }
+}
+
 function createTemplateHandler(channel, builder) {
   return function template(strings, ...values) {
-    const root = this, viewRecord = root[PRIVATE], 
+    const root = this, viewRecord = root[PRIVATE],
       renderChannelRecord = getRenderChannel(viewRecord, root.node, channel, builder);
+
+    activateRootNode(viewRecord, root.node);
 
     if (viewRecord.turn) {
       if (renderChannelRecord.turn !== viewRecord.turn) {
@@ -891,9 +916,10 @@ function renderNextInSlotRange(callback) {
   const slotRange = this[PRIVATE],
     viewRecord = slotRange.viewRecord,
     previous = viewRecord.turn,
-    turn = { channels: [] };
+    turn = { channels: [], roots: new Set(), viewRecord };
 
   viewRecord.turn = turn;
+  activateRootNode(viewRecord, slotRange.container);
   const round = beginSlotRange(slotRange);
 
   try {
