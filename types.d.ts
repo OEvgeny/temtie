@@ -122,6 +122,7 @@ export interface View<Bs extends Builders = DefaultBuilders> {
   mount(container: RenderContainer<Bs>, options: ViewOptions<Bs>): View<Bs>;
   render(): void;
   update(): void;
+  unmount(): void;
 }
 
 export function view<Bs extends Builders = DefaultBuilders>(

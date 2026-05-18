@@ -66,48 +66,76 @@ function createSlotCaller(callback, definition) {
   };
 }
 
+const VIEW_INIT = {
+  id: null,
+  root: null,
+  renderFn: null,
+  builders: null,
+  rootHandlers: null,
+  slotHandlers: null,
+  roots: null,
+  channels: null,
+  turn: null,
+  schedule: null,
+  render() {
+    throw new Error('temtie/view: cannot render before mount()');
+  },
+  update() {
+    throw new Error('temtie/view: cannot update before mount()');
+  },
+  targets: null,
+  mounted: false,
+}
+
 class TemTieView {
-  [PRIVATE] = {
-    id: null,
-    root: null,
-    renderFn: null,
-    builders: null,
-    rootHandlers: null,
-    slotHandlers: null,
-    roots: null,
-    channels: null,
-    turn: null,
-    schedule: null,
-  }
+  [PRIVATE] = Object.assign({}, VIEW_INIT);
 
   constructor(renderFn) {
     this[PRIVATE].renderFn = renderFn;
   }
 
-  render = function() {
-    throw new Error('temtie/view: cannot render before mount()');
+  render() {
+    return (this[PRIVATE]?.render ?? unmounted)();
   }
 
-  update = function() {
-    throw new Error('temtie/view: cannot update before mount()');
+  update() {
+    return (this[PRIVATE]?.update ?? unmounted)();
   }
 
   mount(container, options = {}) {
     const pub = this, priv = this[PRIVATE];
+    if (!priv) unmounted();
+    if (priv.mounted) throw new Error('temtie/view: view is mounted');
     priv.id = options.id ?? nextViewId++;
     priv.builders = options.builders;
     priv.roots = new WeakMap();
     priv.channels = new WeakMap();
     priv.turn = null;
     priv.schedule = options.scheduleUpdate ?? createMicrotaskSchedule();
+    priv.targets = new Set();
+    priv.mounted = true;
     priv.rootHandlers = createTemplateHandlers({ next: renderNextTurn }, priv, createTemplateHandler);
     priv.slotHandlers = createTemplateHandlers({}, priv, createSlotChannelHandler);
     priv.root = rootHandle(priv, container);
-    pub.render = priv.root.next.bind(priv.root, priv.renderFn.bind(pub, priv.root));
-    pub.update = priv.schedule.bind(pub, pub.render);
+    priv.render = priv.root.next.bind(priv.root, priv.renderFn.bind(pub, priv.root));
+    priv.update = priv.schedule.bind(pub, priv.render); 
     pub.render();
     return pub;
   }
+
+  unmount() {
+    const priv = this[PRIVATE];
+    if (!priv) unmounted();
+    if (!priv?.root) throw new Error('temtie/view: cannot unmount before mount()');
+
+    priv.root.next(() => {});
+    priv.mounted = false;
+    delete this[PRIVATE];
+  }
+}
+
+function unmounted() {
+  throw new Error('temtie/view: view is unmounted');
 }
 
 function createMicrotaskSchedule() {
@@ -155,8 +183,10 @@ function activateRootNode(viewRecord, node) {
 }
 
 function renderNextTurn(callback) {
-  const viewRecord = this[PRIVATE], previous = viewRecord.turn, turn = { channels: [], roots: new Set(), viewRecord };
+  const viewRecord = this[PRIVATE];
+  if (!viewRecord?.mounted) unmounted();
 
+  const previous = viewRecord.turn, turn = { channels: [], roots: new Set(), viewRecord };
   viewRecord.turn = turn;
   activateRootNode(viewRecord, this.node);
   debug.enabled && debug.emit({ type: 'turn-start', viewId: viewRecord.id });
@@ -194,9 +224,10 @@ function beginSkippedRootChannels(turn) {
 
 function createTemplateHandler(channel, builder) {
   return function template(strings, ...values) {
-    const root = this, viewRecord = root[PRIVATE],
-      renderChannelRecord = getRenderChannel(viewRecord, root.node, channel, builder);
+    const root = this, viewRecord = root[PRIVATE];
+    if (!viewRecord?.mounted) unmounted();
 
+    const renderChannelRecord = getRenderChannel(viewRecord, root.node, channel, builder);
     activateRootNode(viewRecord, root.node);
 
     if (viewRecord.turn) {
@@ -286,11 +317,6 @@ function assertRange(builder, start, end) {
   throw new Error('temtie/view: invalid range handle: end boundary is unreachable from start');
 }
 
-function containsTargetNode(target, node) {
-  const container = getTargetContainer(target);
-  return target.builder.contains(container, node);
-}
-
 function getTargetContainer(target) {
   return target.startMarker
     ? target.builder.parent(target.startMarker)
@@ -311,6 +337,7 @@ function destroyTarget(target) {
   target.next = [];
   target.round = 0;
   target.cursor = null;
+  target.viewRecord?.targets?.delete(target);
 }
 
 function createTarget(viewRecord, container, builder, options = {}) {
@@ -336,6 +363,7 @@ function createTarget(viewRecord, container, builder, options = {}) {
 }
 
 function beginTarget(target, round) {
+  target.viewRecord?.targets?.add(target);
   target.round = round;
   target.cursor = null;
 
@@ -525,14 +553,14 @@ function getTargetEntry(bucket, key, round) {
   return bucket.byIndex[index];
 }
 
-function getRangeLocation(target, rangeHandle) {
+function getRangeLocation(target, rangeHandle, container) {
   debug.enabled && debug.assert(target, 'getRangeLocation requires a valid target', { assert: 'target', rangeHandle });
 
   if (!rangeHandle?.start) return RANGE_LOCATION.DETACHED;
-  const parent = target.builder.parent(rangeHandle.start), container = getTargetContainer(target);
+  const parent = target.builder.parent(rangeHandle.start);
   if (parent === container) return RANGE_LOCATION.INSIDE;
   if (!parent) return RANGE_LOCATION.DETACHED;
-  if (containsTargetNode(target, rangeHandle.start)) return RANGE_LOCATION.NESTED;
+  if (target.builder.contains(container, rangeHandle.start)) return RANGE_LOCATION.NESTED;
 
   return RANGE_LOCATION.FOREIGN;
 }
@@ -543,8 +571,8 @@ function placeInTarget(target, rangeHandle) {
   if (!rangeHandle?.start || !rangeHandle?.end) throw new TypeError('temtie/view: placeInTarget requires a rangeHandle with start and end boundaries');
 
   const builder = target.builder,
-    location = getRangeLocation(target, rangeHandle),
     container = getTargetContainer(target),
+    location = getRangeLocation(target, rangeHandle, container),
     before = target.cursor ?? target.endMarker ?? null;
 
   if (location === RANGE_LOCATION.INSIDE && rangeHandle.start === before) {
@@ -576,6 +604,7 @@ function placeInTarget(target, rangeHandle) {
 function flushTarget(target, round) {
   debug.enabled && debug.assert(target, 'flushTarget requires a valid target', { assert: 'target', round });
 
+  const container = getTargetContainer(target);
   for (const entry of target.order) {
     if (!entry || entry.round === round) continue;
 
@@ -586,7 +615,7 @@ function flushTarget(target, round) {
       continue;
     }
 
-    const location = getRangeLocation(target, rangeHandle);
+    const location = getRangeLocation(target, rangeHandle, container);
     if (location === RANGE_LOCATION.INSIDE) {
       debug.enabled && debug.emit({
         type: 'dispose-entry',
@@ -621,6 +650,11 @@ function flushTarget(target, round) {
   target.next = [];
   target.round = 0;
   target.cursor = null;
+
+  if (target.order.length)
+    target.viewRecord?.targets?.add(target);
+  else
+    target.viewRecord?.targets?.delete(target);
 
   debug.enabled && debug.emit({
     type: 'commit-target',
@@ -715,8 +749,42 @@ function applyBindings(values) {
 function destroyRange(range) {
   const builder = getRangeBuilder(range, 'destroyRange'), { start, end } = range;
   if (!start || !end) return;
+  destroyContainedTargets(range);
   for (const binding of range.bindings) disposeBinding(binding);
   builder.remove(start, end);
+}
+
+function destroyContainedTargets(range) {
+  const targets = range.target.viewRecord?.targets;
+  if (!targets?.size) return;
+
+  const builder = range.builder,
+    parent = getTargetContainer(range.target),
+    rangeNodes = collectRangeNodes(range, parent);
+  if (!rangeNodes) return;
+
+  for (const target of targets.values()) {
+    let node = target.container;
+    if (target === range.target) continue;
+
+    while (node && builder.parent(node) !== parent) node = builder.parent(node);
+    if (rangeNodes.has(node)) destroyTarget(target);
+  }
+}
+
+function collectRangeNodes(range, parent) {
+  const { builder, start, end } = range;
+  if (builder.parent(start) !== parent || builder.parent(end) !== parent) return null;
+
+  const nodes = new Set();
+  let sibling = start;
+  while (sibling) {
+    nodes.add(sibling);
+    if (sibling === end) return nodes;
+    sibling = builder.next(sibling);
+  }
+
+  return null;
 }
 
 function createBindings(range) {
