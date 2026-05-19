@@ -186,7 +186,7 @@ function renderNextTurn(callback) {
   const viewRecord = this[PRIVATE];
   if (!viewRecord?.mounted) unmounted();
 
-  const previous = viewRecord.turn, turn = { channels: [], roots: new Set(), viewRecord };
+  const previous = viewRecord.turn, turn = { channels: [], roots: new Set(), slotRanges: new Set(), viewRecord };
   viewRecord.turn = turn;
   activateRootNode(viewRecord, this.node);
   debug.enabled && debug.emit({ type: 'turn-start', viewId: viewRecord.id });
@@ -205,6 +205,11 @@ function flushTurn(turn) {
   for (const channel of turn.channels) {
     flushTarget(channel.target, channel.target.round);
     channel.turn = null;
+  }
+
+  for (const slotRange of turn.slotRanges) {
+    const round = slotRange.activeRound?.round;
+    if (round != null) flushSlotRange(slotRange, round);
   }
 }
 
@@ -974,8 +979,12 @@ function createSlotRoot(slotRange) {
 function createSlotChannelHandler(channel, builder) {
   return function slotTemplate(strings, ...values) {
     const slotRange = this[PRIVATE],
+      turn = slotRange.viewRecord.turn,
       target = prepareSlotTarget(slotRange, channel, builder),
       rangeHandle = renderToTarget(target, strings, values);
+
+    if (turn) turn.slotRanges.add(slotRange);
+
     return rootHandle(slotRange.viewRecord, containerNode(rangeHandle) ?? slotRange.container);
   };
 }
@@ -984,7 +993,7 @@ function renderNextInSlotRange(callback) {
   const slotRange = this[PRIVATE],
     viewRecord = slotRange.viewRecord,
     previous = viewRecord.turn,
-    turn = { channels: [], roots: new Set(), viewRecord };
+    turn = { channels: [], roots: new Set(), slotRanges: new Set(), viewRecord };
 
   viewRecord.turn = turn;
   activateRootNode(viewRecord, slotRange.container);
