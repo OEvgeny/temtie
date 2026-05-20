@@ -13,6 +13,7 @@ const RANGE_LOCATION = {
 
 const SKIP = Symbol.for('temtie.slotSkip');
 const VALUE = Symbol.for('temtie.value');
+const RESULTS = Symbol.for('temtie.results');
 const PRIVATE = Symbol('temtie.private');
 
 let nextViewId = 0;
@@ -242,15 +243,20 @@ function createTemplateHandler(channel, builder) {
         viewRecord.turn.channels.push(renderChannelRecord);
       }
 
-      const child = renderToTarget(renderChannelRecord.target, strings, values);
-      return rootHandle(viewRecord, containerNode(child) ?? root.node);
+      const child = renderToTarget(renderChannelRecord.target, strings, values),
+        handle = rootHandle(viewRecord, containerNode(child) ?? root.node);
+
+      handle[RESULTS] = child.results;
+      return handle;
     }
 
     debug.enabled && debug.emit({ type: 'turn-start', viewId: viewRecord.id });
     beginTarget(renderChannelRecord.target, ++renderChannelRecord.round);
     const child = renderToTarget(renderChannelRecord.target, strings, values);
     flushTarget(renderChannelRecord.target, renderChannelRecord.target.round);
-    return rootHandle(viewRecord, containerNode(child) ?? root.node);
+    const handle = rootHandle(viewRecord, containerNode(child) ?? root.node);
+    handle[RESULTS] = child.results;
+    return handle;
   };
 }
 
@@ -741,14 +747,21 @@ function createRangeHandle(range) {
     end: range.end,
     node: range.node ?? null,
     range,
+    results: [],
     apply: applyBindings,
   };
 }
 
 function applyBindings(values) {
-  const range = this.range;
-  for (let i = 0; i < range.bindings.length; i++)
-    if (applyBinding(range, range.bindings[i], values) === null) return null;
+  const range = this.range,
+    results = [];
+
+  this.results = results;
+
+  for (let i = 0; i < range.bindings.length; i++) {
+    const result = applyBinding(range, range.bindings[i], values);
+    results.push(result);
+  }
 }
 
 function destroyRange(range) {
@@ -818,6 +831,7 @@ function createBindings(range) {
         target: null,
         slotRoot: null,
         slotMemo: null,
+        result: undefined,
       });
       continue;
     }
@@ -904,11 +918,13 @@ function applySlotBinding(range, binding, next, protocol) {
   if (result === SKIP) {
     binding.target.activeRound = null;
     binding.prev = next;
-    return;
+    return binding.result;
   }
 
   flushSlotRange(binding.target, round);
   binding.prev = next;
+  binding.result = result;
+  return result;
 }
 
 function ensureSlotMemo(binding, next, protocol) {
@@ -936,6 +952,7 @@ function disposeBinding(binding) {
   disposeSlotBinding(binding);
   binding.target = null;
   binding.slotRoot = null;
+  binding.result = undefined;
 }
 
 function disposeSlotBinding(binding) {
@@ -981,11 +998,13 @@ function createSlotChannelHandler(channel, builder) {
     const slotRange = this[PRIVATE],
       turn = slotRange.viewRecord.turn,
       target = prepareSlotTarget(slotRange, channel, builder),
-      rangeHandle = renderToTarget(target, strings, values);
+      rangeHandle = renderToTarget(target, strings, values),
+      handle = rootHandle(slotRange.viewRecord, containerNode(rangeHandle) ?? slotRange.container);
 
     if (turn) turn.slotRanges.add(slotRange);
 
-    return rootHandle(slotRange.viewRecord, containerNode(rangeHandle) ?? slotRange.container);
+    handle[RESULTS] = rangeHandle.results;
+    return handle;
   };
 }
 
