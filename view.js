@@ -14,6 +14,7 @@ const RANGE_LOCATION = {
 const SKIP = Symbol.for('temtie.slotSkip');
 const VALUE = Symbol.for('temtie.value');
 const RESULTS = Symbol.for('temtie.results');
+const REJECT = Symbol.for('temtie.reject');
 const PRIVATE = Symbol('temtie.private');
 
 let nextViewId = 0;
@@ -425,7 +426,8 @@ function renderToTarget(target, stringsOrTemplate, values = []) {
   });
 
   if (entry.rangeHandle) updateEntry(target, template, entry, values);
-  else createEntry(target, template, entry, values, wasReused);
+
+  if (!entry.rangeHandle) createEntry(target, template, entry, values, wasReused);
 
   return entry.rangeHandle;
 }
@@ -447,7 +449,7 @@ function updateEntry(target, template, entry, values) {
 
   try {
     const result = entry.rangeHandle.apply(values);
-    if (result === null) {
+    if (result === REJECT) {
       const next = entry.rangeHandle?.end ? target.builder.next(entry.rangeHandle.end) : null;
       debug.enabled && debug.emit({
         type: 'element-reattached',
@@ -496,7 +498,7 @@ function createEntry(target, template, entry, values, wasReused) {
 
   try {
     const result = entry.rangeHandle.apply(values);
-    if (result === null) {
+    if (result === REJECT) {
       destroyEntry(entry);
       throw new Error('temtie/view: fresh template range rejected initial binding');
     }
@@ -760,6 +762,7 @@ function applyBindings(values) {
 
   for (let i = 0; i < range.bindings.length; i++) {
     const result = applyBinding(range, range.bindings[i], values);
+    if (result === REJECT) return REJECT;
     results.push(result);
   }
 }
@@ -792,7 +795,7 @@ function destroyContainedTargets(range) {
 
 function collectRangeNodes(range, parent) {
   const { builder, start, end } = range;
-  if (builder.parent(start) !== parent || builder.parent(end) !== parent) return null;
+  if (builder.parent(start) !== parent || builder.parent(end) !== parent) return;
 
   const nodes = new Set();
   let sibling = start;
@@ -802,7 +805,7 @@ function collectRangeNodes(range, parent) {
     sibling = builder.next(sibling);
   }
 
-  return null;
+  return;
 }
 
 function createBindings(range) {
