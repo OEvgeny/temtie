@@ -55,7 +55,8 @@ export function parseTemplate(strings, builder) {
     attrValue = '',
     attrQuote = '',
     closeTagWhitespaceOnly = false,
-    spreadDots = 0;
+    spreadDots = 0,
+    lastHoleMarker = null;
 
   function flushText() {
     if (!textBuffer) return;
@@ -139,10 +140,27 @@ export function parseTemplate(strings, builder) {
     stack.pop();
   }
 
+  // names under # belong to the core. #key is the only resident, and it
+  // exists only as a meta hole — nothing in the namespace may reach the
+  // medium, statically or through a prop hole
+  function assertCoreName(name, meta) {
+    if (name[0] !== '#') return;
+
+    if (!meta)
+      throw new SyntaxError(
+        name === '#key'
+          ? 'temtie/parser syntax error: #key takes an interpolated value: #key${value}'
+          : `temtie/parser syntax error: unknown reserved prop "${name}"`);
+
+    if (name !== '#key')
+      throw new SyntaxError(`temtie/parser syntax error: unknown reserved meta-prop "${name}"`);
+  }
+
   function setStaticProp(name, value) {
     if (!pendingNode)
       throw new SyntaxError(`temtie/parser syntax error: cannot set static attribute "${name}" without an open tag`);
 
+    assertCoreName(name, false);
     assertUniqueName(pendingAttrNames, name, 'attribute');
 
     const decoded =
@@ -153,27 +171,27 @@ export function parseTemplate(strings, builder) {
     builder.setProp(pendingNode, name, decoded);
   }
 
+  // a child hole is a single marker: a permanent anchor that content lands
+  // after, referenced only while the hole has no content to speak for it
   function emitChildHole(slot) {
     flushText();
 
     const ctx = stack.at(-1),
-      startPath = [...ctx.path, ctx.childIndex];
-    builder.insert(ctx.node, builder.createMarker());
-
-    const endPath = [...ctx.path, ctx.childIndex + 1];
-    builder.insert(ctx.node, builder.createMarker());
+      marker = builder.createMarker();
+    builder.insert(ctx.node, marker);
 
     holes.push({
       type: TEMPLATE_HOLE_TYPES.CHILD,
       slot,
-      startPath,
-      endPath,
+      path: [...ctx.path, ctx.childIndex],
     });
 
-    ctx.childIndex += 2;
+    if (ctx.node === fragment) lastHoleMarker = marker;
+    ctx.childIndex += 1;
   }
 
   function emitAttrHole(slot) {
+    assertCoreName(attrName, false);
     assertUniqueName(pendingAttrNames, attrName, 'attribute');
 
     holes.push({
@@ -190,6 +208,7 @@ export function parseTemplate(strings, builder) {
   }
 
   function emitMetaHole(slot) {
+    assertCoreName(attrName, true);
     assertUniqueName(pendingMetaNames, attrName, 'metadata');
 
     holes.push({
@@ -562,6 +581,12 @@ export function parseTemplate(strings, builder) {
   else if (mode === TEMPLATE_PARSER_MODES.SELF_CLOSE)
     throw new SyntaxError('temtie/parser syntax error: malformed self-closing tag');
 
+  // hole content lands after its marker, so a template ending in a
+  // top-level hole gets a pin: the fragment's last node must stay physical
+  // for segment ranges to hold
+  if (lastHoleMarker && builder.lastChild(fragment) === lastHoleMarker)
+    builder.insert(fragment, builder.createMarker());
+
   return { fragment, holes };
 }
 
@@ -572,22 +597,30 @@ let TEMPLATE_CACHE = new WeakMap();
  * @returns {number}
  */
 export function deriveKeySlot(holes) {
-  for (const hole of holes)
-    if (
-      hole.type === TEMPLATE_HOLE_TYPES.META &&
-      hole.name === 'key' &&
-      Array.isArray(hole.path) &&
-      hole.path.length === 1
-    ) return hole.slot;
+  let slot = -1;
 
-  return -1;
+  for (const hole of holes) {
+    if (hole.type !== TEMPLATE_HOLE_TYPES.META || hole.name !== '#key') continue;
+
+    // a reserved name is never silently dead: #key either keys the segment
+    // or refuses to compile
+    if (!Array.isArray(hole.path) || hole.path.length !== 1)
+      throw new SyntaxError('temtie/parser syntax error: #key belongs on a root element of the template');
+
+    if (slot !== -1)
+      throw new SyntaxError('temtie/parser syntax error: a template takes a single #key');
+
+    slot = hole.slot;
+  }
+
+  return slot;
 }
 
 /**
  * @template {Builder} B
  * @param {TemplateStringsArray} strings
  * @param {B} builder
- * @param {{ vctx?: { id?: string | number } | null }} [options]
+ * @param {{ vctx?: object | null, pass?: number }} [options]
  * @returns {Template<B>}
  */
 export function compileTemplate(strings, builder, options = {}) {
@@ -607,6 +640,15 @@ export function compileTemplate(strings, builder, options = {}) {
     cached = cache.get(rawKey);
   if (cached) return cached;
 
+  const ev = debug.enabled && debug.emit({
+    type: 'compile',
+    builder,
+    target: options.vctx ?? null,
+    pass: options.pass,
+    site: strings,
+    html: strings.join('${...}').slice(0, 100),
+  });
+
   const { fragment, holes } = parseTemplate(strings, builder),
     keySlot = deriveKeySlot(holes),
     template = {
@@ -622,15 +664,7 @@ export function compileTemplate(strings, builder, options = {}) {
 
   cache.set(rawKey, template);
 
-  debug.enabled && debug.emit({
-    type: 'compile-template',
-    builder,
-    viewId: options.vctx?.id,
-    template,
-    site: strings,
-    html: strings.join('${...}').slice(0, 100),
-    partsCount: holes.length,
-  });
+  ev && debug.emit({ type: 'compiled', cause: ev.seq, template });
 
   return template;
 }

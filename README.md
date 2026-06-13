@@ -2,196 +2,200 @@
 
 **Template calls that remember their place and update from there.**
 
+Temtie is an immediate-mode template runtime. You call tagged templates
+from ordinary JavaScript, those calls record a target's next shape, and
+`commit()` applies the recorded pass to the medium.
+
 ```js
-import { view, define } from 'temtie/view.js';
+import { mount, capture, commit } from 'temtie/core.js';
 import { DOMBuilder } from 'temtie/builder/dom.js';
 
-const Item = define((root, text) => {
-  root.html`<li>${text}</li>`;
-});
+const app = mount(document.body, { builders: { html: DOMBuilder } });
 
 let items = ['first', 'second'];
-let empty = false;
 
-const app = view((root) => {
-  const section = root.html`<section></section>`;
+function render() {
+  const list = capture();
 
-  if (empty) {
-    section.html`<p>No items yet</p>`;
-    return;
-  }
+  app.html`
+    <section>
+      <h1>Items</h1>
+      <ul>${list}</ul>
+    </section>
+  `;
 
-  const list = section.html`<ul></ul>`;
   for (const item of items) {
-    list.html`${Item(item)}`;
+    list.html`<li #key${item}>${item}</li>`;
   }
-});
 
-app.mount(document.body, { builders: { html: DOMBuilder } });
+  commit(app);
+}
+
+render();
 ```
 
-Temtie turns tagged template calls into stable update points. Each call site is
-compiled once, then reused on later renders. You write normal JavaScript flow:
-loops, conditions, function calls. Temtie keeps the template holes tied to where
-they appeared.
+The render language is JavaScript including, but not limited to loops, branches,
+functions, generators etc.
 
-No virtual tree. No build step. No separate update language.
+## Mounts And Captures
 
-## The Idea
-
-Most template systems split the work in two. First you describe output, then a
-runtime decides how to diff or mutate it.
-
-Temtie keeps the update path inside the template call itself. When the same
-render function runs again, the same template call sites are visited. The
-library reuses those sites and updates their slots.
+`mount(container, { builders })` creates a target seated on a container.
 
 ```js
-const Row = define((root, item) => {
-  root.html`<li>${item.label}</li>`;
-});
-
-const app = view((root) => {
-  const list = root.html`<ol></ol>`;
-
-  for (const item of items) {
-    list.html`${Row(item)}`;
-  }
-});
+const app = mount(document.body, { builders: { html: DOMBuilder } });
+app.html`<main>Hello</main>`;
+commit(app);
 ```
 
-The `Row(item)` value belongs to the hole where it is placed. On the next
-render, that slot receives the next value. If the value is unchanged, the
-builder can leave it alone. Otherwise, only that place updates.
+`capture()` creates a free target reference. It gets builder channels when it is
+interpolated into a template slot.
+
+```js
+const body = capture();
+
+app.html`<main>${body}</main>`;
+body.html`<h1>Dashboard</h1>`;
+commit(app);
+```
+
+Captured targets are the composition primitive. They let a parent own layout
+while a child owns its own update cycle:
+
+```js
+const shell = mount(document.body, { builders: { html: DOMBuilder } });
+const clock = capture();
+
+shell.html`<header>${clock}</header><main>...</main>`;
+commit(shell);
+
+setInterval(() => {
+  clock.html`<time>${new Date().toLocaleTimeString()}</time>`;
+  commit(clock);
+}, 1000);
+```
+
+During commit touched targets are flushed from the passed one, so in this case
+the shell doesn't re-run when the clock commits.
+
+## Template slots
+
+Child targets write child content:
+
+```js
+root.html`<p>${message}</p>`;
+```
+
+Attribute slots write properties or attributes:
+
+```js
+root.html`<button disabled=${locked}>Save</button>`;
+```
+
+Spread slots write prop bags:
+
+```js
+root.html`<input ...${props}>`;
+```
+
+Fresh spread object must be used when values change. Mutating and reusing 
+the same bag is invisible to the diffing step.
+
+Captures can occupy child slots and prop slots allowing passing content as props:
+
+```js
+const pane = capture();
+
+root.html`<section>${pane}</section>`;
+pane.html`<p>child target</p>`;
+
+root.html`<widget view=${pane}></widget>`;
+// the prop receives pane's output
+```
+
+Spread slots cannot host targets or value contracts.
+
+## Skip And Reset
+
+`skip(target)` voids an uncommitted pass. The committed output remains, and
+nothing staged by the skipped pass is released.
+
+```js
+try {
+  content.html`<article>${smh}</article>`;
+  thisThrows();
+  content.html`...`;
+} catch (error) {
+  skip(content);
+  errors.html`<pre>${error.message}</pre>`;
+  content.html`${smh}`; // nested targets can be recovered
+}
+
+commit(app);
+```
+
+`reset(target)` stages emptiness. The next `commit(target)` clears that target.
+If you render into it again before committing, segments can still be borrowed.
+
+```js
+reset(list);
+commit(list); // list is now empty
+```
 
 ## Builders
 
-Temtie renders through builders. A builder is a small object that knows how to
-create output, set properties, move ranges, and replace child values.
-
-The DOM builder ships with the package:
+Temtie renders through builders. A builder owns parsing products, node/range
+movement, property writes, and child writes.
 
 ```js
 import { DOMBuilder, SVGBuilder } from 'temtie/builder/dom.js';
 
-app.mount(document.body, {
+const app = mount(document.body, {
   builders: {
     html: DOMBuilder,
     svg: SVGBuilder,
   },
 });
+
+app.html`<button>${label}</button>`;
+app.svg`<svg><circle r=${4}></circle></svg>`;
+commit(app);
 ```
 
-Each builder becomes a template channel on the root:
+Each builder key becomes a channel on every target in that universe.
 
-```js
-root.html`<button>${label}</button>`;
-root.svg`<svg><circle r="4"></circle></svg>`;
-```
+## Template Syntax
 
-DOM is just one builder target. The same template identity model can be used for
-virtual nodes or other output shapes.
+The parser is intentionally small and strict.
 
-## Updates
-
-`update()` schedules a microtask. Multiple calls in the same synchronous turn
-collapse into one render.
-
-```js
-count++;
-app.update();
-
-count++;
-app.update();
-
-// The microtask renders once with the final count.
-```
-
-Use `render()` when you want to run immediately:
-
-```js
-app.render();
-```
-
-## Slots
-
-`define()` creates a slot value. Slot values can be placed in child holes.
-
-```js
-const Greet = define((root, name) => {
-  root.html`<span>Hello, ${name}</span>`;
-});
-
-root.html`<p>${Greet('Alice')}</p>`;
-```
-
-`define.state()` creates a stateful slot. The init function runs once for the
-slot identity and returns a render function.
-
-```js
-const Counter = define.state((root, initialLabel = 'Count', start = 0) => {
-  let count = start;
-
-  return (label = initialLabel) => {
-    root.html`
-      <button onclick=${() => {
-        count++;
-        app.update();
-      }}>
-        ${label}: ${count}
-      </button>
-    `;
-  };
-});
-
-root.html`${Counter('Counter')}`;
-```
-
-Plain values including functions still go through the builder.
+- Dynamic attributes are unquoted: `class=${name}`.
+- Quoted dynamic attributes are rejected: `class="${name}"`.
+- Spread props use `...${props}` inside an opening tag.
+- `#key${value}` keys a root element segment scoped to template.
+- Text in child slots is text, not HTML.
 
 ## API
 
-### `view(render)`
+### `mount(container, { builders })`
 
-Creates a view. The render callback receives a root with builder channels.
+Creates a mounted target and returns its instance. `builders` maps channel names
+to builder objects.
 
-```js
-const app = view((root) => {
-  root.html`<h1>Hello</h1>`;
-});
-```
+### `capture()`
 
-### `app.mount(container, options)`
+Creates a free target reference. It receives channels once it is interpolated into a
+slot that can host it.
 
-Attaches the view and performs the first render.
+### `commit(target)`
 
-```js
-app.mount(document.body, {
-  builders: { html: DOMBuilder },
-});
-```
+Settles the recorded pass for a target and staged/moved children into it.
 
-Options:
+### `skip(target)`
 
-- `builders`: required map of template tags to builders.
-- `scheduleUpdate`: optional scheduler for `update()`.
-- `id`: optional debug identifier.
+Voids the target instance's currently staged pass. Committed output stands.
 
-### `app.render()`
+### `reset(target)`
 
-Runs the render function synchronously.
-
-### `app.update()`
-
-Schedules a batched render.
-
-### `define(render)`
-
-Creates a stateless slot definition.
-
-### `define.state(init)`
-
-Creates a stateful slot definition.
+Stages an empty pass. The next commit clears the instance.
 
 ## License
 

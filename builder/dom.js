@@ -109,11 +109,14 @@ function removeRange(start, end) {
   range.deleteContents();
 }
 
-function setChild(startMarker, endMarker, value) {
-  const parent = startMarker.parentNode;
-  if (!parent) return;
+// the marker is a permanent anchor: content lives right after it and is
+// remembered by identity (prev), so the marker is only consulted when the
+// hole holds nothing. returns the node the hole holds now.
+function setChild(marker, prev, value) {
+  const parent = marker.parentNode;
+  if (!parent) return prev;
 
-  const first = startMarker.nextSibling,
+  const before = prev && prev.parentNode === parent ? prev : marker.nextSibling,
     isPrimitive = value == null ||
       typeof value === 'string' ||
       typeof value === 'number' ||
@@ -122,30 +125,27 @@ function setChild(startMarker, endMarker, value) {
   if (isPrimitive) {
     const text = value == null || value === false ? '' : String(value);
 
-    if (
-      text &&
-      first &&
-      first !== endMarker &&
-      first.nodeType === 3 &&
-      first.nextSibling === endMarker
-    ) {
-      setText(first, text);
-      return;
+    if (!text) {
+      prev?.parentNode?.removeChild(prev);
+      return null;
     }
 
-    if (first && first !== endMarker)
-      this.remove(first, endMarker.previousSibling);
+    if (prev && prev.parentNode === parent && prev.nodeType === 3) {
+      setText(prev, text);
+      return prev;
+    }
 
-    if (text)
-      parent.insertBefore(getOwnerDocument(parent).createTextNode(text), endMarker);
-
-    return;
+    const node = getOwnerDocument(parent).createTextNode(text);
+    parent.insertBefore(node, before);
+    prev?.parentNode?.removeChild(prev);
+    return node;
   }
 
-  if (first && first !== endMarker)
-    this.remove(first, endMarker.previousSibling);
-
-  parent.insertBefore(toNode(value), endMarker);
+  const node = toNode(value);
+  if (node === prev) return prev;
+  parent.insertBefore(node, before);
+  prev?.parentNode?.removeChild(prev);
+  return node;
 }
 
 const VOID_ELEMENTS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);

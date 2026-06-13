@@ -1,0 +1,571 @@
+/* ꙋ temtie · core.js */
+/** @import { Mount, Capture, Commit, Skip, Reset } from './types.d.ts' */
+
+import { compileTemplate, TEMPLATE_HOLE_TYPES as HOLE } from './parser.js';
+import debug from './debug.js';
+
+const PRIVATE = Symbol('temtie.private');
+const UNSET = Symbol('temtie.unset');
+const VALUE = Symbol.for('temtie.value');
+const ROOT = 'root';
+
+// one clock for all targets: a stale structure can never masquerade as
+// fresh by crossing targets
+let PASS = 0;
+
+const IDLE = 'idle', STAGED = 'staged', SEALED = 'sealed';
+
+// the core is a matrix of two axes: destinations — how a hole reaches the
+// medium — and occupants — who holds it: a plain value, a body (a target
+// named by a ref), or a contract instance owning a body of its own. a ref
+// that brings a target gives it to the hole, an empty ref inherits the
+// hole's target. render stages, commit settles, and one law covers every
+// ending: out of the medium at commit = disposed. only bodies die — a
+// name interpolated again grows a fresh body.
+
+/** @type {Mount} */
+export function mount(container, { builders } = {}) {
+  if (!container) throw new Error(`temtie/core: expected container, got ${String(container)}`);
+  if (!builders || typeof builders !== 'object' || !Object.keys(builders).length)
+    throw new Error('temtie/core: mount() requires builders, e.g. mount(el, { builders: { html } })');
+
+  const ref = makeRef(makeTarget(makeProto(builders), { dest: DEST[ROOT], node: container }));
+  debug.enabled && debug.emit({ type: 'mount', target: ref.target, container, builders: Object.keys(builders) });
+  return ref.inst;
+}
+
+/** @type {Capture} */
+export function capture() {
+  return makeRef(null).inst;
+}
+
+/** @type {Commit} */
+export function commit(inst) {
+  const ref = inst?.[PRIVATE];
+  if (!ref) throw new TypeError('temtie/core: commit() expects a target from mount() or capture()');
+  if (ref.target) commitTarget(ref.target);
+}
+
+// skip() voids an uncommitted pass: the committed DOM stands, everything
+// stays borrowable. until a render calls the target again, commit treats the
+// seal as a wall — nothing the failed pass staged can surface through it.
+/** @type {Skip} */
+export function skip(inst) {
+  const ref = inst?.[PRIVATE];
+  if (!ref) throw new TypeError('temtie/core: skip() expects a target from mount() or capture()');
+  const target = ref.target;
+  if (target?.state !== STAGED) return;
+  call(target, 'skip');
+  target.state = SEALED;
+}
+
+// reset() stages emptiness: the next commit flushes blank, a render before
+// it rebuilds — segments stay borrowable.
+/** @type {Reset} */
+export function reset(inst) {
+  const ref = inst?.[PRIVATE];
+  if (!ref) throw new TypeError('temtie/core: reset() expects a target from mount() or capture()');
+  const target = ref.target;
+  if (!target) return;
+  call(target, 'reset');
+}
+
+// a pass begins: userland called in — through a channel (render), or via
+// skip()/reset(). a point event, never paired: an opened pass may be
+// re-staged into the next before it ever commits, so nothing closes it.
+function call(target, via = 'render') {
+  target.state = STAGED;
+  target.pass = ++PASS;
+  target.cursor = target.head;
+  debug.enabled && debug.emit({ type: 'call', target, pass: target.pass, via });
+}
+
+function makeProto(builders) {
+  const proto = {};
+  for (const [name, builder] of Object.entries(builders))
+    proto[name] = makeChannel(builder);
+  return proto;
+}
+
+function makeRef(target) {
+  const ref = { inst: Object.create(target ? target.proto : null), target };
+  Object.defineProperty(ref.inst, PRIVATE, { value: ref });
+  return ref;
+}
+
+function makeTarget(proto, anchor) {
+  const head = { prev: null, next: null };
+  return {
+    proto,
+    anchor,
+    parent: null,
+    children: new Set(),
+    // one chain, one cursor: live content is head..cursor in emission
+    // order, everything past the cursor awaits the flush sweep
+    head,
+    cursor: head,
+    pass: 0,
+    state: IDLE,
+    moved: false, // orthogonal: an idle target can still need placement
+    buckets: new Map(),
+  };
+}
+
+function makeChannel(builder) {
+  return function channel(strings, ...values) {
+    const target = this[PRIVATE].target;
+    // the pass opens before the template compiles: an ad-hoc compile is a
+    // cost of the pass that first touched the site, and the event says so
+    touch(target);
+    const template = compileTemplate(strings, builder, { vctx: target, pass: target.pass });
+    const segment = takeSegment(target, template, values);
+    const ev = debug.enabled && debug.emit({
+      type: 'stage', target, pass: target.pass, segment, template,
+      fresh: segment.pass === 0,
+      key: template.keySlot >= 0 ? values[template.keySlot] : undefined,
+      stack: debug.stacks ? new Error('stage') : undefined,
+    });
+    emit(target, segment);
+    if (debug.enabled && ev) debug.cause = ev.seq;
+    resolveSegment(target, segment, values);
+    if (debug.enabled && ev) debug.cause = ev.cause;
+  };
+}
+
+function touch(target) {
+  if (target.state === STAGED) return;
+  if (target.state === SEALED) {
+    target.state = STAGED;
+    return;
+  }
+  call(target);
+}
+
+function takeSegment(target, template, values) {
+  let bucket = target.buckets.get(template);
+  if (!bucket) target.buckets.set(template, bucket = { byIndex: [], byKey: new Map(), used: -1, pass: 0 });
+  if (bucket.pass !== target.pass) {
+    bucket.pass = target.pass;
+    bucket.used = -1;
+  }
+
+  const key = template.keySlot >= 0 ? values[template.keySlot] : undefined;
+  let segment = key !== undefined ? bucket.byKey.get(key) : bucket.byIndex[++bucket.used];
+  if (!segment) {
+    segment = makeSegment(template);
+    if (key !== undefined) bucket.byKey.set(key, segment);
+    else bucket.byIndex[bucket.used] = segment;
+  }
+  return segment;
+}
+
+function makeSegment(template) {
+  const builder = template.builder,
+    fragment = builder.clone(template.fragment);
+
+  let start = builder.firstChild(fragment), end = builder.lastChild(fragment);
+  if (!start) {
+    const marker = builder.createMarker();
+    builder.insert(fragment, marker);
+    start = end = marker;
+  }
+
+  const bindings = template.holes.map((hole) => makeBinding(builder, fragment, hole));
+  return { template, builder, start, end, bindings, values: [], prev: null, next: null, pass: 0 };
+}
+
+// a child marker never moves and never leaves: content lives after it
+function makeBinding(builder, fragment, hole) {
+  const dest = DEST[hole.type],
+    node = builder.resolve(fragment, hole.path);
+  return {
+    dest,
+    slot: hole.slot,
+    builder,
+    marker: dest.kind === HOLE.CHILD ? node : null,
+    node: dest.kind === HOLE.CHILD ? null : node,
+    prop: hole.prop,
+    name: hole.name ?? null,
+    container: null,
+    occupant: null,
+    leavers: null,
+    handle: null,
+    bag: dest.kind === HOLE.SPREAD ? {} : null,
+  };
+}
+
+// splices the segment in after the cursor, preserving the borrowable tail
+function emit(target, segment) {
+  if (segment === target.cursor) return;
+  segment.pass = target.pass;
+  if (target.cursor.next === segment) {
+    target.cursor = segment;
+    return;
+  }
+  if (segment.prev) {
+    segment.prev.next = segment.next;
+    if (segment.next) segment.next.prev = segment.prev;
+  }
+  const tail = target.cursor.next;
+  segment.prev = target.cursor;
+  segment.next = tail;
+  if (tail) tail.prev = segment;
+  target.cursor.next = segment;
+  target.cursor = segment;
+}
+
+// a destination answers for its hole kind: where a hosted body lives
+// (container/after), how a value reaches the medium (write), how a body is
+// handed over (deliver). the capabilities are the law: no write — a value
+// never reaches the medium; no container — nothing can anchor there.
+const DEST = {
+  [ROOT]: {
+    kind: ROOT,
+    container: (anchor) => anchor.node,
+  },
+  [HOLE.CHILD]: {
+    kind: HOLE.CHILD,
+    container: (binding) => binding.builder.parent(binding.marker),
+    after: (binding) => binding.marker,
+    write(binding, value) {
+      debug.enabled && debug.emit({ type: 'write', binding, value });
+      const occupant = binding.occupant;
+      occupant.node = binding.builder.setChild(binding.marker, occupant.node, value);
+    },
+  },
+  [HOLE.ATTR]: {
+    kind: HOLE.ATTR,
+    container: (binding) => binding.container ??= binding.builder.createRoot(),
+    write(binding, value) {
+      debug.enabled && debug.emit({ type: 'write', binding, value });
+      binding.builder.setProp(binding.node, binding.prop, value);
+    },
+    // handover, never reconciliation: the receiver decides what a
+    // re-assignment means
+    deliver(binding) {
+      binding.builder.setProp(binding.node, binding.prop, binding.container);
+    },
+  },
+  [HOLE.META]: {
+    kind: HOLE.META,
+    closed: true, // takes no target from the outside, only an instance body
+    container: (binding) => binding.node,
+  },
+  [HOLE.SPREAD]: {
+    kind: HOLE.SPREAD,
+    eager: true, // re-diffs every flush: the bag may be the same object mutated
+    write(binding, value) {
+      debug.enabled && debug.emit({ type: 'write', binding, value });
+      const next = value == null ? {} : Object(value);
+      for (const name of Object.keys(binding.bag))
+        if (!(name in next)) binding.builder.unsetProp(binding.node, name);
+      for (const name of Object.keys(next))
+        if (binding.bag[name] !== next[name]) binding.builder.setProp(binding.node, name, next[name]);
+      binding.bag = next;
+    },
+  },
+};
+
+function resolveSegment(target, segment, values) {
+  segment.values = values;
+  for (const binding of segment.bindings) {
+    const raw = values[binding.slot],
+      init = raw?.[VALUE];
+    if (init !== undefined) resolveInstance(target, binding, raw, init);
+    else if (raw?.[PRIVATE]) resolveBody(target, binding, raw[PRIVATE]);
+    else resolvePlain(binding);
+  }
+}
+
+function resolvePlain(binding) {
+  if (binding.occupant?.kind === 'plain') return;
+  displace(binding);
+  if (!binding.dest.write) return;
+  binding.occupant = { kind: 'plain', prev: UNSET, node: null };
+  debug.enabled && debug.emit({ type: 'claim', binding, occupant: binding.occupant });
+}
+
+function resolveBody(parent, binding, ref) {
+  // a closed hole's host has no marker, so placement among its content is
+  // undefined; an instance body may still anchor there — knowingly
+  if (binding.dest.closed)
+    throw new Error('temtie/core: a meta hole cannot host a target');
+  if (!binding.dest.container)
+    throw new Error('temtie/core: a spread hole cannot host a target');
+
+  const occupant = binding.occupant,
+    child = ref.target
+      ?? (occupant?.kind === 'body' ? occupant.body : null)
+      ?? makeTarget(parent.proto, null);
+  if (child.anchor?.dest.kind === ROOT)
+    throw new Error('temtie/core: a mounted root cannot be interpolated into a template');
+  if (child === parent)
+    throw new Error('temtie/core: a target cannot be interpolated into itself');
+
+  if (ref.target !== child) {
+    ref.target = child;
+    Object.setPrototypeOf(ref.inst, child.proto);
+  }
+  if (occupant?.kind !== 'body' || occupant.body !== child) {
+    displace(binding);
+    binding.occupant = { kind: 'body', body: child };
+    debug.enabled && debug.emit({ type: 'claim', binding, occupant: binding.occupant });
+  }
+  hook(parent, child, binding);
+}
+
+// the VALUE contract: { [Symbol.for('temtie.value')]: init, props }. init
+// runs once per claim, its closure is the instance state, and it returns
+// the hooks (a bare function reads as { render }). render(t) goes through
+// the supplied body, so render-phase work is DOM-pure by construction.
+// commit(handle) runs at every flush of the owning segment; release(handle)
+// fires when the claim ends — displaced, or disposed with its segment.
+function resolveInstance(parent, binding, raw, init) {
+  if (typeof init !== 'function')
+    throw new TypeError('temtie/core: a contract value must carry an init function under Symbol.for("temtie.value")');
+  if (!binding.dest.container)
+    throw new Error('temtie/core: a spread hole cannot host a contract');
+
+  const props = raw.props ?? [];
+  let occupant = binding.occupant;
+  if (occupant?.kind !== 'instance' || occupant.init !== init) {
+    displace(binding);
+    const ref = makeRef(makeTarget(parent.proto, null));
+    occupant = binding.occupant = { kind: 'instance', init, ref, body: ref.target, hooks: null, node: null };
+    debug.enabled && debug.emit({ type: 'claim', binding, occupant });
+    hook(parent, occupant.body, binding);
+    const made = init(ref.inst, ...props);
+    occupant.hooks = typeof made === 'function' ? { render: made } : made ?? {};
+  } else {
+    hook(parent, occupant.body, binding); // the body follows its binding every pass
+  }
+  occupant.hooks.render?.(occupant.ref.inst, ...props);
+}
+
+function hook(parent, child, binding) {
+  if (child.anchor === binding) return;
+  child.parent?.children.delete(child);
+  child.parent = parent;
+  child.anchor = binding;
+  child.moved = true;
+  parent.children.add(child);
+}
+
+// displacing is bookkeeping: the DOM stays put until the ends fire at
+// flush. a leaver another hole already claimed this pass keeps that claim
+function displace(binding) {
+  const occupant = binding.occupant;
+  if (!occupant) return;
+  debug.enabled && debug.emit({ type: 'displace', binding, occupant });
+  binding.occupant = null;
+  (binding.leavers ??= []).push(occupant);
+  const body = occupant.body;
+  if (body && body.anchor === binding) {
+    body.parent?.children.delete(body);
+    body.parent = null;
+    body.anchor = null;
+    body.moved = false;
+  }
+}
+
+function end(binding, occupant, sink) {
+  debug.enabled && debug.emit({ type: 'end', binding, occupant });
+  if (occupant.kind === 'instance') occupant.hooks.release?.(handleOf(binding));
+  if (occupant.node && binding.builder.parent(occupant.node))
+    binding.builder.extract(occupant.node, occupant.node);
+  if (occupant.body) endBody(occupant.body, sink);
+}
+
+function endBody(body, sink) {
+  // re-anchored: evict only while the move is pending — its DOM
+  // legitimately lives elsewhere otherwise
+  if (body.anchor) {
+    if (body.moved) evictChain(body.head.next);
+    return;
+  }
+  evictChain(body.head.next);
+  sink(body);
+}
+
+function evictChain(segment) {
+  for (; segment; segment = segment.next)
+    if (segment.builder.parent(segment.start)) segment.builder.extract(segment.start, segment.end);
+}
+
+// ends fire only at flush: a voided pass frees nothing
+function flushEnds(binding, sink = disposeTarget) {
+  if (!binding.leavers) return;
+  const batch = binding.leavers;
+  binding.leavers = null;
+  for (const occupant of batch) end(binding, occupant, sink);
+}
+
+// a dying segment's standing occupant is displaced like any other leaver
+function sweepSegment(segment, sink) {
+  for (const binding of segment.bindings) {
+    displace(binding);
+    flushEnds(binding, sink);
+  }
+}
+
+// a disposed target is left empty but valid: its ref renders again from scratch
+function disposeTarget(target) {
+  const queue = [target], seen = new Set(queue);
+  const sink = (child) => { if (!seen.has(child)) seen.add(child), queue.push(child); };
+  for (let index = 0; index < queue.length; index++) {
+    const current = queue[index];
+    debug.enabled && debug.emit({ type: 'dispose', target: current });
+    for (let segment = current.head.next; segment; segment = segment.next) sweepSegment(segment, sink);
+    current.head.next = null;
+    current.cursor = current.head;
+    current.buckets.clear();
+    current.children.clear();
+    current.state = IDLE;
+    current.moved = false;
+  }
+}
+
+// not borrowed this pass = gone at flush: the buckets drop what the chain
+// sweep shed, by the same stamps
+function pruneBuckets(target) {
+  for (const [template, bucket] of target.buckets) {
+    if (bucket.pass !== target.pass) {
+      target.buckets.delete(template);
+      continue;
+    }
+    if (bucket.byIndex.length > bucket.used + 1) bucket.byIndex.length = bucket.used + 1;
+    for (const [key, segment] of bucket.byKey)
+      if (segment.pass !== target.pass) bucket.byKey.delete(key);
+  }
+}
+
+// flush only what was staged, parents before children; the queue keeps deep
+// trees off the call stack, the seen set keeps cycles to one visit
+function commitTarget(target) {
+  const root = debug.enabled && debug.emit({
+    type: 'commit', target, pass: target.pass,
+    stack: debug.stacks ? new Error('commit') : undefined,
+  });
+  if (debug.enabled && root) debug.cause = root.seq;
+
+  const queue = [target], seen = new Set(queue);
+  for (let index = 0; index < queue.length; index++) {
+    const current = queue[index];
+    if (current.state === SEALED) { // the wall: no flush, no descent
+      debug.enabled && debug.emit({ type: 'sealed', target: current, pass: current.pass });
+      continue;
+    }
+    if (current.state === STAGED) settle(current, 'flush', flushTarget);
+    else if (current.moved) settle(current, 'place', placeTarget);
+    for (const child of current.children)
+      if (!seen.has(child)) seen.add(child), queue.push(child);
+  }
+
+  if (debug.enabled && root) {
+    debug.emit({ type: 'settled', target });
+    debug.cause = root.cause;
+  }
+}
+
+function settle(target, type, run) {
+  const ev = debug.enabled && debug.emit({ type, target, pass: target.pass });
+  if (ev) debug.cause = ev.seq;
+  run(target);
+  if (ev) debug.cause = ev.cause;
+}
+
+// an idle body whose anchor moved is placed, not re-rendered
+function placeTarget(target) {
+  target.moved = false;
+  flushEnds(target.anchor);
+  let prevEnd = null;
+  for (let segment = target.head.next; segment; segment = segment.next) {
+    place(target, segment, prevEnd);
+    prevEnd = segment.end;
+  }
+  if (target.head.next) deliver(target); // a virgin body delivers nothing
+}
+
+function flushTarget(target) {
+  if (!target.anchor) throw new Error('temtie/core: cannot commit an unanchored capture');
+  target.state = IDLE;
+  target.moved = false;
+  flushEnds(target.anchor);
+
+  const boundary = target.cursor;
+  if (boundary !== target.head) {
+    let prevEnd = null;
+    for (let segment = target.head.next; ; segment = segment.next) {
+      place(target, segment, prevEnd);
+      for (const binding of segment.bindings) flushBinding(binding, segment.values);
+      prevEnd = segment.end;
+      if (segment === boundary) break;
+    }
+  }
+
+  for (let segment = boundary.next; segment; segment = segment.next) {
+    debug.enabled && debug.emit({ type: 'drop', target, segment });
+    if (segment.builder.parent(segment.start)) segment.builder.extract(segment.start, segment.end);
+    sweepSegment(segment, disposeTarget);
+  }
+  boundary.next = null;
+  pruneBuckets(target);
+  deliver(target);
+}
+
+function deliver(target) {
+  const anchor = target.anchor;
+  if (!anchor.dest.deliver) return;
+  debug.enabled && debug.emit({ type: 'deliver', target, binding: anchor });
+  anchor.dest.deliver(anchor);
+}
+
+function place(target, segment, prevEnd) {
+  const builder = segment.builder,
+    anchor = target.anchor,
+    container = anchor.dest.container(anchor),
+    after = prevEnd ?? anchor.dest.after?.(anchor);
+
+  if (
+    builder.parent(segment.start) === container &&
+    (!after || builder.prev(segment.start) === after)
+  ) return;
+
+  debug.enabled && debug.emit({ type: 'move', target, segment, container, after: after ?? null });
+  const content = builder.extract(segment.start, segment.end);
+  builder.insert(container, content, after ? builder.next(after) : null);
+}
+
+function flushBinding(binding, values) {
+  flushEnds(binding);
+  const occupant = binding.occupant;
+  if (!occupant) return;
+  if (occupant.kind === 'instance') occupant.hooks.commit?.(handleOf(binding));
+  else if (occupant.kind === 'plain') {
+    const value = values[binding.slot];
+    if (binding.dest.eager || value !== occupant.prev) {
+      binding.dest.write(binding, value);
+      occupant.prev = value;
+    }
+  }
+  // a body flushes itself: it is a target in the commit walk
+}
+
+function handleOf(binding) {
+  return binding.handle ??= makeHandle(binding);
+}
+
+// set() exists only where the destination writes — a meta handle observes
+function makeHandle(binding) {
+  const dest = binding.dest,
+    handle = {
+      kind: dest.kind,
+      builder: binding.builder,
+      node: binding.node,
+      marker: binding.marker,
+      prop: binding.prop ?? null,
+      name: binding.name,
+    };
+  if (dest.write) handle.set = (value) => dest.write(binding, value);
+  return handle;
+}
