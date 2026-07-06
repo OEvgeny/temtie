@@ -139,50 +139,6 @@ root.html`<widget view=${pane}></widget>`;
 
 Spread slots cannot host targets or value contracts.
 
-## The Value Contract
-
-A slot value carrying `Symbol.for('temtie.value')` is claimed by the runtime
-instead of being written to the medium. The contract is how a value owns
-state, a lifecycle, and — when it needs one — its own update cycle:
-
-```js
-const VALUE = Symbol.for('temtie.value');
-
-function stopwatch(body) {          // init: runs once per claim
-  let seconds = 0;
-  const timer = setInterval(() => { // the closure is the instance state
-    seconds += 1;
-    body.html`<time>${seconds}s</time>`;
-    commit(body);                   // its own record → commit cycle
-  }, 1000);
-
-  return {
-    render: (body) => body.html`<time>${seconds}s</time>`,
-    release: () => clearInterval(timer),
-  };
-}
-
-app.html`<aside>${{ [VALUE]: stopwatch }}</aside>`;
-commit(app);
-```
-
-The rules:
-
-- `init(body, ...props)` runs once per claim. Its closure is the instance
-  state. It returns the hooks — a bare function reads as `{ render }`.
-- **Claim identity follows the init function.** The same function in the same
-  slot keeps its claim across passes, which is why the parent above can
-  re-render freely without restarting the stopwatch. A different init — or a
-  plain value — displaces the instance, and `release` fires at the next flush.
-- `render(body, ...props)` runs on every pass of the owning target with the
-  current props. Work goes through the supplied body, so render-phase code is
-  medium-pure by construction.
-- `commit(handle)` fires at every flush of the owning segment, `release(handle)`
-  when the claim ends. The handle reaches the slot's destination — its
-  `set(value)` writes where the slot writes. Its exact shape is still
-  settling; read `makeHandle` in `core.js` before leaning on it.
-- Props ride the value: `${{ [VALUE]: greet, props: [name] }}`.
-
 ## Skip And Reset
 
 `skip(target)` voids an uncommitted pass. The committed output remains, and
