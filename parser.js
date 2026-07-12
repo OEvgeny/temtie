@@ -1,7 +1,9 @@
 /* ꙋ temtie · parser.js */
 /** @import { Builder, Template, Hole } from './types.d.ts' */
 
-import debug from './debug.js';
+import { TEMPLATE_HOLE_TYPES } from './core.js';
+
+export { TEMPLATE_HOLE_TYPES };
 
 const TEMPLATE_PARSER_MODES = {
   TEXT: 'TEXT',
@@ -13,13 +15,6 @@ const TEMPLATE_PARSER_MODES = {
   ATTR_VALUE: 'ATTR_VALUE',
   CLOSE_TAG: 'CLOSE_TAG',
   SELF_CLOSE: 'SELF_CLOSE',
-};
-
-export const TEMPLATE_HOLE_TYPES = {
-  CHILD: 'child',
-  ATTR: 'attr',
-  SPREAD: 'spread',
-  META: 'meta',
 };
 
 const NAME_DELIMITER_RE = /[\s"'<>/=]/;
@@ -36,7 +31,7 @@ function isNameChar(char) {
   return !!char && !NAME_DELIMITER_RE.test(char) && char !== '/';
 }
 
-export function parseTemplate(strings, builder) {
+function parseTemplate(strings, builder) {
   const fragment = builder.createRoot(),
     holes = [],
     decodeStatic = builder.decodeStatic ?? (value => value),
@@ -590,13 +585,13 @@ export function parseTemplate(strings, builder) {
   return { fragment, holes };
 }
 
-let TEMPLATE_CACHE = new WeakMap();
+const TEMPLATE_CACHE = new WeakMap();
 
 /**
  * @param {readonly Hole[]} holes
  * @returns {number}
  */
-export function deriveKeySlot(holes) {
+function deriveKeySlot(holes) {
   let slot = -1;
 
   for (const hole of holes) {
@@ -620,10 +615,9 @@ export function deriveKeySlot(holes) {
  * @template {Builder} B
  * @param {TemplateStringsArray} strings
  * @param {B} builder
- * @param {{ vctx?: object | null, pass?: number }} [options]
  * @returns {Template<B>}
  */
-export function compileTemplate(strings, builder, options = {}) {
+export function compileTemplate(strings, builder) {
   if (!builder || (typeof builder !== 'object' && typeof builder !== 'function'))
     throw new TypeError('temtie/parser: compileTemplate requires a builder object');
 
@@ -636,44 +630,21 @@ export function compileTemplate(strings, builder, options = {}) {
     TEMPLATE_CACHE.set(builder, cache);
   }
 
+  // keyed by text, not site: two sites spelling the same template share
+  // one — the core memoizes per site above, this dedupes beneath it
   const rawKey = strings.raw ? strings.raw.join('\x00') : String(strings),
     cached = cache.get(rawKey);
   if (cached) return cached;
 
-  const ev = debug.enabled && debug.emit({
-    type: 'compile',
-    builder,
-    target: options.vctx ?? null,
-    pass: options.pass,
-    site: strings,
-    html: strings.join('${...}').slice(0, 100),
-  });
-
   const { fragment, holes } = parseTemplate(strings, builder),
-    keySlot = deriveKeySlot(holes),
     template = {
       site: strings,
       builder,
       fragment,
       holes,
-      keySlot,
-      metadata: typeof builder.getTemplateMetadata === 'function'
-        ? builder.getTemplateMetadata({ site: strings, fragment, holes, keySlot }) ?? null
-        : null,
+      keySlot: deriveKeySlot(holes),
     };
 
   cache.set(rawKey, template);
-
-  ev && debug.emit({ type: 'compiled', cause: ev.seq, template });
-
   return template;
-}
-
-export function clearTemplateCache(builder) {
-  if (!builder) {
-    TEMPLATE_CACHE = new WeakMap();
-    return;
-  }
-
-  TEMPLATE_CACHE.delete(builder);
 }

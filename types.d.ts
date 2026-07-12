@@ -4,6 +4,10 @@ export type PropertyKeyLike = string | number | symbol;
 
 /* Builder contract */
 export interface Builder<Node = unknown, Root = Node> {
+  // syntax belongs to the builder: compile turns a site's statics into a
+  // template. most builders delegate to parser.js's compileTemplate; the
+  // core guarantees one call per site and stamps builder/keySlot if absent
+  compile(strings: TemplateStringsArray): Template<Builder<Node, Root>>;
   createRoot(): Root;
   decodeStatic?(value: string, context?: 'text' | 'attr'): string;
   isVoidElement?(tag: string): boolean;
@@ -40,13 +44,12 @@ export type BuilderRoot<B> = B extends Builder<any, infer Root> ? Root : never;
 export type RenderContainer<Bs extends Builders> =
   BuilderNode<AnyBuilderOf<Bs>> | BuilderRoot<AnyBuilderOf<Bs>>;
 
-export interface Template<B extends Builder = Builder, Metadata = unknown> {
+export interface Template<B extends Builder = Builder> {
   readonly site: TemplateStringsArray;
   readonly builder: B;
   readonly fragment: BuilderRoot<B>;
   readonly holes: readonly Hole[];
   readonly keySlot: number;
-  readonly metadata: Metadata | null;
 }
 
 export type Hole =
@@ -90,16 +93,8 @@ export type Reset = (instance: Instance<any>) => void;
 
 export function compileTemplate<B extends Builder>(
   strings: TemplateStringsArray,
-  builder: B,
-  options?: { vctx?: { id?: string | number } | null; pass?: number }
-): Template<B>;
-
-export function parseTemplate<B extends Builder>(
-  strings: TemplateStringsArray,
   builder: B
-): Pick<Template<B>, 'fragment' | 'holes'>;
-
-export function clearTemplateCache(builder?: Builder | null): void;
+): Template<B>;
 
 // a live target handle as a listener sees it: the node in the render tree the
 // event touched. its remaining fields are core-internal.
@@ -186,6 +181,12 @@ declare module 'temtie/core.js' {
   export const commit: Commit;
   export const skip: Skip;
   export const reset: Reset;
+  export const TEMPLATE_HOLE_TYPES: {
+    readonly CHILD: 'child';
+    readonly ATTR: 'attr';
+    readonly SPREAD: 'spread';
+    readonly META: 'meta';
+  };
 }
 
 declare module 'temtie/debug.js' {
@@ -196,4 +197,11 @@ declare module 'temtie/debug.js' {
 declare module 'temtie/builder/dom.js' {
   export const DOMBuilder: Builder<Node, DocumentFragment>;
   export const SVGBuilder: Builder<Node, DocumentFragment>;
+}
+
+declare module 'temtie/builder/markup.js' {
+  export const MarkupBuilder: Builder<object, object>;
+  // reads the committed tree into a markup string: every text node and
+  // attribute value escapes on the way out
+  export function serialize(node: object): string;
 }

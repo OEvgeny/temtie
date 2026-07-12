@@ -1,13 +1,23 @@
 /* ꙋ temtie · core.js */
 /** @import { Mount, Capture, Commit, Skip, Reset } from './types.d.ts' */
 
-import { compileTemplate, TEMPLATE_HOLE_TYPES as HOLE } from './parser.js';
 import debug from './debug.js';
 
 const PRIVATE = Symbol('temtie.private');
 const UNSET = Symbol('temtie.unset');
 const VALUE = Symbol.for('temtie.value');
 const ROOT = 'root';
+
+// the hole vocabulary is the matrix's row labels: compilers emit it, DEST
+// answers for it. it lives here because what a hole IS belongs to the
+// core — how one is spelled belongs to whoever compiled the template.
+export const TEMPLATE_HOLE_TYPES = {
+  CHILD: 'child',
+  ATTR: 'attr',
+  SPREAD: 'spread',
+  META: 'meta',
+};
+const HOLE = TEMPLATE_HOLE_TYPES;
 
 // one clock for all targets: a stale structure can never masquerade as
 // fresh by crossing targets
@@ -82,8 +92,11 @@ function call(target, via = 'render') {
 
 function makeProto(builders) {
   const proto = {};
-  for (const [name, builder] of Object.entries(builders))
+  for (const [name, builder] of Object.entries(builders)) {
+    if (typeof builder?.compile !== 'function')
+      throw new TypeError(`temtie/core: builder "${name}" must compile its own templates — compile(strings), e.g. parser.js's compileTemplate`);
     proto[name] = makeChannel(builder);
+  }
   return proto;
 }
 
@@ -111,13 +124,39 @@ function makeTarget(proto, anchor) {
   };
 }
 
+// compiling is the builder's; once-per-site is the core's. the memo keys
+// on the strings array — the call site — so template identity is core law,
+// not builder discipline. a builder may still dedupe identical text
+// underneath (parser.js does), and the sites then share one template.
+const TEMPLATES = new WeakMap(); // builder → site → template
+
+function compile(builder, strings, target) {
+  let cache = TEMPLATES.get(builder);
+  if (!cache) TEMPLATES.set(builder, cache = new WeakMap());
+  const cached = cache.get(strings);
+  if (cached) return cached;
+
+  const ev = debug.enabled && debug.emit({
+    type: 'compile', builder, target, pass: target.pass,
+    site: strings, html: strings.join('${...}').slice(0, 100),
+  });
+  const template = builder.compile(strings);
+  if (!template?.fragment || !Array.isArray(template.holes))
+    throw new TypeError('temtie/core: builder.compile() must return a template { fragment, holes, keySlot }');
+  template.builder ??= builder;
+  template.keySlot ??= -1;
+  cache.set(strings, template);
+  ev && debug.emit({ type: 'compiled', cause: ev.seq, template });
+  return template;
+}
+
 function makeChannel(builder) {
   return function channel(strings, ...values) {
     const target = this[PRIVATE].target;
     // the pass opens before the template compiles: an ad-hoc compile is a
     // cost of the pass that first touched the site, and the event says so
     touch(target);
-    const template = compileTemplate(strings, builder, { vctx: target, pass: target.pass });
+    const template = compile(builder, strings, target);
     const segment = takeSegment(target, template, values);
     const ev = debug.enabled && debug.emit({
       type: 'stage', target, pass: target.pass, segment, template,
@@ -231,7 +270,7 @@ const DEST = {
       debug.enabled && debug.emit({ type: 'write', binding, value });
       const occupant = binding.occupant;
       occupant.node = binding.builder.setChild(binding.marker, occupant.node, value);
-    },
+    }
   },
   [HOLE.ATTR]: {
     kind: HOLE.ATTR,
@@ -244,7 +283,7 @@ const DEST = {
     // re-assignment means
     deliver(binding) {
       binding.builder.setProp(binding.node, binding.prop, binding.container);
-    },
+    }
   },
   [HOLE.META]: {
     kind: HOLE.META,
@@ -262,8 +301,8 @@ const DEST = {
       for (const name of Object.keys(next))
         if (binding.bag[name] !== next[name]) binding.builder.setProp(binding.node, name, next[name]);
       binding.bag = next;
-    },
-  },
+    }
+  }
 };
 
 function resolveSegment(target, segment, values) {

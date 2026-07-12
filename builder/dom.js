@@ -1,6 +1,8 @@
 /* ꙋ temtie · builder · dom.js */
 /** @import { Builder } from '../types.d.ts' */
 
+import { compileTemplate } from '../parser.js';
+
 const SVG_NAMESPACE = 'http://www.w3.org/2000/svg';
 const TEMTIE_PROP_NAMES = Symbol.for('temtie.propNames');
 
@@ -155,6 +157,10 @@ function isVoidElement(tag) {
 
 /** @type {Builder<Node, DocumentFragment>} */
 export const DOMBuilder = {
+  compile(strings) {
+    return compileTemplate(strings, this);
+  },
+
   createRoot() {
     return getGlobalDocument().createDocumentFragment();
   },
