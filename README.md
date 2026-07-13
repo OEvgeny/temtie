@@ -209,8 +209,8 @@ Templates compile once per call site per builder and are cached.
 ## Debugging
 
 The runtime narrates itself. `debug.js` is an event hub every phase reports
-to — mount, call, stage, claim, write, move, drop, commit, dispose — with
-zero cost while nothing listens.
+to — mount, call, stage, claim, write, move, drop, commit, dispose. While
+nothing listens, the guarded event objects are not created.
 
 ```js
 import debug from 'temtie/debug.js';
@@ -218,7 +218,15 @@ import debug from 'temtie/debug.js';
 const off = debug.on((event) => console.log(event.seq, event.type));
 ```
 
-Events carry `seq` and `cause`, so spans nest: `meter()` pairs them into
+A production entry can permanently detach observers and reject future ones
+for that module instance:
+
+```js
+debug.disable();
+```
+
+Events carry `seq` and `cause`, so their synchronous contexts nest. Explicit
+start/end pairs can be measured: `meter()` turns them into
 `performance.measure` entries for the profiler.
 
 ```js

@@ -94,7 +94,7 @@ function makeProto(builders) {
   const proto = {};
   for (const [name, builder] of Object.entries(builders)) {
     if (typeof builder?.compile !== 'function')
-      throw new TypeError(`temtie/core: builder "${name}" must compile its own templates — compile(strings), e.g. parser.js's compileTemplate`);
+      throw new TypeError(`temtie/core: builder "${name}" must have compile(strings)`);
     proto[name] = makeChannel(builder);
   }
   return proto;
@@ -165,9 +165,7 @@ function makeChannel(builder) {
       stack: debug.stacks ? new Error('stage') : undefined,
     });
     emit(target, segment);
-    if (debug.enabled && ev) debug.cause = ev.seq;
-    resolveSegment(target, segment, values);
-    if (debug.enabled && ev) debug.cause = ev.cause;
+    withCause(ev, () => resolveSegment(target, segment, values));
   };
 }
 
@@ -485,32 +483,36 @@ function commitTarget(target) {
     type: 'commit', target, pass: target.pass,
     stack: debug.stacks ? new Error('commit') : undefined,
   });
-  if (debug.enabled && root) debug.cause = root.seq;
 
-  const queue = [target], seen = new Set(queue);
-  for (let index = 0; index < queue.length; index++) {
-    const current = queue[index];
-    if (current.state === SEALED) { // the wall: no flush, no descent
-      debug.enabled && debug.emit({ type: 'sealed', target: current, pass: current.pass });
-      continue;
+  withCause(root, () => {
+    const queue = [target], seen = new Set(queue);
+    for (let index = 0; index < queue.length; index++) {
+      const current = queue[index];
+      if (current.state === SEALED) { // the wall: no flush, no descent
+        debug.enabled && debug.emit({ type: 'sealed', target: current, pass: current.pass });
+        continue;
+      }
+      if (current.state === STAGED) settle(current, 'flush', flushTarget);
+      else if (current.moved) settle(current, 'place', placeTarget);
+      for (const child of current.children)
+        if (!seen.has(child)) seen.add(child), queue.push(child);
     }
-    if (current.state === STAGED) settle(current, 'flush', flushTarget);
-    else if (current.moved) settle(current, 'place', placeTarget);
-    for (const child of current.children)
-      if (!seen.has(child)) seen.add(child), queue.push(child);
-  }
 
-  if (debug.enabled && root) {
-    debug.emit({ type: 'settled', target });
-    debug.cause = root.cause;
-  }
+    debug.enabled && root && debug.emit({ type: 'settled', target });
+  });
 }
 
 function settle(target, type, run) {
   const ev = debug.enabled && debug.emit({ type, target, pass: target.pass });
-  if (ev) debug.cause = ev.seq;
-  run(target);
-  if (ev) debug.cause = ev.cause;
+  withCause(ev, () => run(target));
+}
+
+function withCause(ev, run) {
+  if (!ev) return run();
+  const cause = debug.cause;
+  debug.cause = ev.seq;
+  try { return run(); }
+  finally { debug.cause = cause; }
 }
 
 // an idle body whose anchor moved is placed, not re-rendered

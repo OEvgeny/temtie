@@ -3,36 +3,43 @@
 
 const listeners = new Set();
 
-let defaultEnabled = false;
+let disabled = false;
 let seq = 0;
 
 function noop() {}
 
+function report(error) {
+  try {
+    if (typeof globalThis.reportError === 'function') globalThis.reportError(error);
+    else globalThis.console?.error?.('temtie/debug: listener failed', error);
+  } catch { /* reporting is best-effort */ }
+}
+
 /** @type {DebugHub} */
 const debug = {
-  enabled: defaultEnabled,
-  stacks: false, // when true, span events carry a captured stack
+  enabled: false,
+  stacks: false, // when true, stage and commit carry a captured stack
   cause: 0, // the enclosing span's seq: emit stamps it on events that carry none
 
   on(fn) {
-    const hub = this;
-    hub.enabled = true;
+    if (disabled) return noop;
+    this.enabled = true;
     listeners.add(fn);
-    return function off() {
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
       listeners.delete(fn);
-      if (!listeners.size) hub.enabled = defaultEnabled;
+      this.enabled = listeners.size > 0;
     };
   },
 
-  enable() {
-    this.assert(this.on !== noop, 'debug.enable(): cannot be enabled once was disabled', { assert: 'debug.enable' });
-    this.enabled = true;
-    defaultEnabled = true;
-  },
-
+  // the production fuse: detach every observer and reject future ones for
+  // this module instance. Deliberately irreversible.
   disable() {
-    this.clear();
-    Object.assign(this, { on: noop, enabled: false });
+    disabled = true;
+    listeners.clear();
+    this.enabled = false;
   },
 
   assert(condition, message, ev = {}) {
@@ -50,7 +57,10 @@ const debug = {
   emit(ev) {
     ev.seq = ++seq;
     ev.cause ??= this.cause;
-    for (const fn of listeners) fn(ev);
+    for (const fn of listeners) {
+      try { fn(ev); }
+      catch (error) { report(error); }
+    }
     return ev;
   },
 
@@ -76,11 +86,7 @@ const debug = {
         perf.measure(ends.get(ev.type), { start, end: perf.now() });
       }
     });
-  },
-
-  clear() {
-    listeners.clear();
-  },
+  }
 };
 
 export default debug;

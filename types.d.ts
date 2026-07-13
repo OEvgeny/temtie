@@ -129,7 +129,7 @@ export interface DebugSegment {
 interface DebugEventBase {
   readonly seq: number; // total order, assigned by the hub
   readonly cause: number; // the enclosing span's seq, 0 at the root
-  readonly stack?: Error; // present on span events while debug.stacks is on
+  readonly stack?: Error; // present on stage and commit while debug.stacks is on
 }
 
 export type DebugEvent = DebugEventBase & (
@@ -159,14 +159,12 @@ export interface DebugHub {
   stacks: boolean; // when true, span events carry a captured Error stack
   cause: number; // the enclosing span's seq; emit stamps it where none is given
   on(listener: (event: DebugEvent) => void): () => void;
+  disable(): void; // permanently detach and reject listeners for this module instance
   emit<E extends { type: string }>(event: E): E & { seq: number; cause: number };
-  enable(): void;
-  disable(): void;
   assert(condition: unknown, message: string, event?: Record<string, unknown>): void;
   // pair cause-linked span events into performance.measure entries, named by
   // the caller — e.g. meter({ 'temtie:commit': ['commit', 'settled'] })
   meter(spans: Record<string, readonly [start: string, end: string]>, perf?: DebugMeterClock): () => void;
-  clear(): void;
 }
 
 /* Default builder set */
