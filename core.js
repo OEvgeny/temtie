@@ -270,7 +270,11 @@ const DEST = {
     write(binding, value) {
       debug.enabled && debug.emit({ type: 'write', binding, value });
       const occupant = binding.occupant;
-      occupant.node = binding.builder.setChild(binding.marker, occupant.node, value);
+      occupant.after = binding.builder.setChild(binding.marker, occupant.after, value);
+    },
+    clear(binding, occupant) {
+      if (occupant.after)
+        occupant.after = binding.builder.setChild(binding.marker, occupant.after, null);
     }
   },
   [HOLE.ATTR]: {
@@ -321,7 +325,7 @@ function resolvePlain(binding) {
   if (binding.occupant?.kind === 'plain') return;
   displace(binding);
   if (!binding.dest.write) return;
-  binding.occupant = { kind: 'plain', prev: UNSET, node: null };
+  binding.occupant = { kind: 'plain', prev: UNSET, after: binding.marker };
   debug.enabled && debug.emit({ type: 'claim', binding, occupant: binding.occupant });
 }
 
@@ -371,7 +375,7 @@ function resolveInstance(parent, binding, raw, init) {
   if (occupant?.kind !== 'instance' || occupant.init !== init) {
     displace(binding);
     const ref = makeRef(makeTarget(parent.proto, null));
-    occupant = binding.occupant = { kind: 'instance', init, ref, body: ref.target, hooks: null, node: null };
+    occupant = binding.occupant = { kind: 'instance', init, ref, body: ref.target, hooks: null, after: binding.marker };
     debug.enabled && debug.emit({ type: 'claim', binding, occupant });
     hook(parent, occupant.body, binding);
     const made = init(ref.inst, ...props);
@@ -411,8 +415,7 @@ function displace(binding) {
 function end(binding, occupant, sink) {
   debug.enabled && debug.emit({ type: 'end', binding, occupant });
   if (occupant.kind === 'instance') occupant.hooks.release?.(handleOf(binding));
-  if (occupant.node && binding.builder.parent(occupant.node))
-    binding.builder.extract(occupant.node, occupant.node);
+  binding.dest.clear?.(binding, occupant);
   if (occupant.body) endBody(occupant.body, sink);
 }
 

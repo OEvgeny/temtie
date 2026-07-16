@@ -28,7 +28,10 @@ export interface Builder<Node = unknown, Root = Node> {
   remove(start: Node, end: Node): void;
   next(node: Node): Node | null;
   prev(node: Node): Node | null;
-  setChild(marker: Node, prev: Node | null, value: Renderable): Node | null;
+  // `after` is the tail of the range owned after `marker`; marker itself
+  // means empty. Core returns it only to this builder and marker. Replacing
+  // or clearing the child invalidates the old tail and returns the new one.
+  setChild(marker: Node, after: Node, value: Renderable): Node;
   toNode(...values: Renderable[]): Node | Root;
   toNodes(value: Renderable): Node[];
   collectRange(start: Node, end: Node): Node[];
@@ -107,9 +110,9 @@ export interface DebugTarget {
 export type DebugVia = 'render' | 'skip' | 'reset';
 
 export type DebugOccupant =
-  | { readonly kind: 'plain'; readonly node: unknown }
+  | { readonly kind: 'plain'; readonly after: unknown }
   | { readonly kind: 'body'; readonly body: DebugTarget }
-  | { readonly kind: 'instance'; readonly body: DebugTarget; readonly init: Function };
+  | { readonly kind: 'instance'; readonly body: DebugTarget; readonly init: Function; readonly after: unknown };
 
 export interface DebugBinding {
   readonly dest: { readonly kind: 'root' | 'child' | 'attr' | 'meta' | 'spread' };

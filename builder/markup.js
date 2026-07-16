@@ -19,6 +19,39 @@ function detach(node) {
   node.parent = null;
 }
 
+function collectRange(start, end) {
+  if (start === end) return [start];
+  if (!start?.parent || start.parent !== end?.parent)
+    throw new Error('temtie/builder/markup: range boundaries must be siblings');
+
+  const siblings = start.parent.children,
+    from = siblings.indexOf(start),
+    to = siblings.indexOf(end);
+  if (from < 0 || to < from)
+    throw new Error('temtie/builder/markup: range end is unreachable from start');
+  return siblings.slice(from, to + 1);
+}
+
+function isIterable(value) {
+  return value != null && typeof value !== 'string' && typeof value[Symbol.iterator] === 'function';
+}
+
+function toNodes(value) {
+  if (value == null || value === false) return [];
+  if (value?.fragment) return value.children.slice();
+  if (value?.start && value?.end) return collectRange(value.start, value.end);
+  if (Array.isArray(value)) return value.flatMap(toNodes);
+  if (isIterable(value)) return Array.from(value).flatMap(toNodes);
+  if (typeof value === 'object') return [value];
+  return [{ text: String(value), parent: null }];
+}
+
+function toNode(...values) {
+  const nodes = values.flatMap(toNodes);
+  if (nodes.length === 1) return nodes[0];
+  return { fragment: true, children: nodes };
+}
+
 const VOID_ELEMENTS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
 
 const NAMED_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: '\u00a0' };
@@ -90,27 +123,42 @@ export const MarkupBuilder = {
     return fragment;
   },
 
-  setChild(marker, prev, value) {
-    if (value == null || value === false) {
-      if (prev) detach(prev);
-      return null;
+  collectRange,
+  toNode,
+  toNodes,
+
+  setChild(marker, after, value) {
+    const parent = marker.parent;
+    if (!parent) return after;
+
+    const previous = after === marker ? [] : collectRange(this.next(marker), after),
+      isPrimitive = value == null ||
+        typeof value === 'string' ||
+        typeof value === 'number' ||
+        typeof value === 'boolean',
+      text = isPrimitive && value != null && value !== false ? String(value) : '';
+
+    if (text && previous.length === 1 && 'text' in previous[0]) {
+      previous[0].text = text;
+      return after;
     }
 
-    if (typeof value !== 'object' && prev && 'text' in prev && prev.parent === marker.parent) {
-      prev.text = String(value);
-      return prev;
-    }
+    const next = text
+      ? [{ text, parent: null }]
+      : isPrimitive
+        ? []
+        : [...new Set(toNodes(value))],
+      retained = new Set(next);
 
-    const parent = marker.parent,
-      node = typeof value === 'object' ? value : { text: String(value), parent: null },
-      index = prev && prev.parent === parent
-        ? parent.children.indexOf(prev)
-        : parent.children.indexOf(marker) + 1;
-    detach(node);
-    parent.children.splice(index, 0, node);
-    node.parent = parent;
-    if (prev && prev !== node) detach(prev);
-    return node;
+    let before = marker.parent.children[marker.parent.children.indexOf(marker) + 1] ?? null;
+    for (const node of next) {
+      if (node === before) before = this.next(before);
+      else this.insert(parent, node, before);
+    }
+    for (const node of previous)
+      if (!retained.has(node)) detach(node);
+
+    return next.at(-1) ?? marker;
   },
 
   // props store raw values; what an attribute means is decided at serialize.

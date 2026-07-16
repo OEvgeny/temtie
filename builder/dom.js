@@ -68,7 +68,8 @@ function collectRange(start, end) {
 
 function toNodes(value) {
   if (value == null || value === false) return [];
-  if (isDomNode(value)) return [value];
+  if (isDomNode(value))
+    return value.nodeType === 11 ? Array.from(value.childNodes) : [value];
   if (
     typeof value === 'object' &&
     value &&
@@ -111,43 +112,41 @@ function removeRange(start, end) {
   range.deleteContents();
 }
 
-// the marker is a permanent anchor: content lives right after it and is
-// remembered by identity (prev), so the marker is only consulted when the
-// hole holds nothing. returns the node the hole holds now.
-function setChild(marker, prev, value) {
+// the marker is the permanent left anchor; `after` is the range's current
+// tail, with marker itself spelling empty. replacement may retain and reorder
+// owned nodes, but releases every node left outside the next range.
+function setChild(marker, after, value) {
   const parent = marker.parentNode;
-  if (!parent) return prev;
+  if (!parent) return after;
 
-  const before = prev && prev.parentNode === parent ? prev : marker.nextSibling,
+  const previous = after === marker ? [] : collectRange(marker.nextSibling, after),
     isPrimitive = value == null ||
       typeof value === 'string' ||
       typeof value === 'number' ||
-      typeof value === 'boolean';
+      typeof value === 'boolean',
+    text = isPrimitive && value != null && value !== false ? String(value) : '';
 
-  if (isPrimitive) {
-    const text = value == null || value === false ? '' : String(value);
-
-    if (!text) {
-      prev?.parentNode?.removeChild(prev);
-      return null;
-    }
-
-    if (prev && prev.parentNode === parent && prev.nodeType === 3) {
-      setText(prev, text);
-      return prev;
-    }
-
-    const node = getOwnerDocument(parent).createTextNode(text);
-    parent.insertBefore(node, before);
-    prev?.parentNode?.removeChild(prev);
-    return node;
+  if (text && previous.length === 1 && previous[0].nodeType === 3) {
+    setText(previous[0], text);
+    return after;
   }
 
-  const node = toNode(value);
-  if (node === prev) return prev;
-  parent.insertBefore(node, before);
-  prev?.parentNode?.removeChild(prev);
-  return node;
+  const next = text
+    ? [getOwnerDocument(parent).createTextNode(text)]
+    : isPrimitive
+      ? []
+      : [...new Set(toNodes(value))],
+    retained = new Set(next);
+
+  let before = marker.nextSibling;
+  for (const node of next) {
+    if (node === before) before = before.nextSibling;
+    else parent.insertBefore(node, before);
+  }
+  for (const node of previous)
+    if (!retained.has(node)) node.parentNode?.removeChild(node);
+
+  return next.at(-1) ?? marker;
 }
 
 const VOID_ELEMENTS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
