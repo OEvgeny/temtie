@@ -625,14 +625,13 @@ export function compileTemplate(strings, builder) {
     throw new TypeError('temtie/parser: compileTemplate requires a template strings object');
 
   let cache = TEMPLATE_CACHE.get(builder);
-  if (!cache) {
-    cache = new Map();
-    TEMPLATE_CACHE.set(builder, cache);
-  }
+  if (!cache) TEMPLATE_CACHE.set(builder, cache = new Map());
 
-  // keyed by text, not site: two sites spelling the same template share
-  // one — the core memoizes per site above, this dedupes beneath it
-  const rawKey = strings.raw ? strings.raw.join('\x00') : String(strings),
+  // compilation shape may be shared by text; call-site identity belongs to
+  // core, which wraps this result in a separate site record
+  const rawKey = strings.raw
+    ? Array.from(strings.raw, (part) => `${part.length}:${part}`).join('')
+    : String(strings),
     cached = cache.get(rawKey);
   if (cached) return cached;
 

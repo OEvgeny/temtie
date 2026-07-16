@@ -124,15 +124,14 @@ function makeTarget(proto, anchor) {
   };
 }
 
-// compiling is the builder's; once-per-site is the core's. the memo keys
-// on the strings array — the call site — so template identity is core law,
-// not builder discipline. a builder may still dedupe identical text
-// underneath (parser.js does), and the sites then share one template.
-const TEMPLATES = new WeakMap(); // builder → site → template
+// compiling is the builder's; site identity is the core's. the cache holds a
+// record per strings array so a compiler may share one compiled template
+// without collapsing separate call sites into one segment bucket.
+const SITES = new WeakMap(); // builder → strings → { template }
 
 function compile(builder, strings, target) {
-  let cache = TEMPLATES.get(builder);
-  if (!cache) TEMPLATES.set(builder, cache = new WeakMap());
+  let cache = SITES.get(builder);
+  if (!cache) SITES.set(builder, cache = new WeakMap());
   const cached = cache.get(strings);
   if (cached) return cached;
 
@@ -145,9 +144,10 @@ function compile(builder, strings, target) {
     throw new TypeError('temtie/core: builder.compile() must return a template { fragment, holes, keySlot }');
   template.builder ??= builder;
   template.keySlot ??= -1;
-  cache.set(strings, template);
+  const site = { template };
+  cache.set(strings, site);
   ev && debug.emit({ type: 'compiled', cause: ev.seq, template });
-  return template;
+  return site;
 }
 
 function makeChannel(builder) {
@@ -156,8 +156,9 @@ function makeChannel(builder) {
     // the pass opens before the template compiles: an ad-hoc compile is a
     // cost of the pass that first touched the site, and the event says so
     touch(target);
-    const template = compile(builder, strings, target);
-    const segment = takeSegment(target, template, values);
+    const site = compile(builder, strings, target),
+      template = site.template,
+      segment = takeSegment(target, site, values);
     const ev = debug.enabled && debug.emit({
       type: 'stage', target, pass: target.pass, segment, template,
       fresh: segment.pass === 0,
@@ -178,9 +179,10 @@ function touch(target) {
   call(target);
 }
 
-function takeSegment(target, template, values) {
-  let bucket = target.buckets.get(template);
-  if (!bucket) target.buckets.set(template, bucket = { byIndex: [], byKey: new Map(), used: -1, pass: 0 });
+function takeSegment(target, site, values) {
+  const template = site.template;
+  let bucket = target.buckets.get(site);
+  if (!bucket) target.buckets.set(site, bucket = { byIndex: [], byKey: new Map(), used: -1, pass: 0 });
   if (bucket.pass !== target.pass) {
     bucket.pass = target.pass;
     bucket.used = -1;
@@ -189,15 +191,16 @@ function takeSegment(target, template, values) {
   const key = template.keySlot >= 0 ? values[template.keySlot] : undefined;
   let segment = key !== undefined ? bucket.byKey.get(key) : bucket.byIndex[++bucket.used];
   if (!segment) {
-    segment = makeSegment(template);
+    segment = makeSegment(site);
     if (key !== undefined) bucket.byKey.set(key, segment);
     else bucket.byIndex[bucket.used] = segment;
   }
   return segment;
 }
 
-function makeSegment(template) {
-  const builder = template.builder,
+function makeSegment(site) {
+  const template = site.template,
+    builder = template.builder,
     fragment = builder.clone(template.fragment);
 
   let start = builder.firstChild(fragment), end = builder.lastChild(fragment);
@@ -465,9 +468,9 @@ function disposeTarget(target) {
 // not borrowed this pass = gone at flush: the buckets drop what the chain
 // sweep shed, by the same stamps
 function pruneBuckets(target) {
-  for (const [template, bucket] of target.buckets) {
+  for (const [site, bucket] of target.buckets) {
     if (bucket.pass !== target.pass) {
-      target.buckets.delete(template);
+      target.buckets.delete(site);
       continue;
     }
     if (bucket.byIndex.length > bucket.used + 1) bucket.byIndex.length = bucket.used + 1;
