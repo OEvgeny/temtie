@@ -1,1 +1,4 @@
 node_modules/
+private/
+gh-pages/
+spec/
