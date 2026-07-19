@@ -585,8 +585,6 @@ function parseTemplate(strings, builder) {
   return { fragment, holes };
 }
 
-const TEMPLATE_CACHE = new WeakMap();
-
 /**
  * @param {readonly Hole[]} holes
  * @returns {number}
@@ -624,17 +622,6 @@ export function compileTemplate(strings, builder) {
   if (!strings || (typeof strings !== 'object' && typeof strings !== 'function'))
     throw new TypeError('temtie/parser: compileTemplate requires a template strings object');
 
-  let cache = TEMPLATE_CACHE.get(builder);
-  if (!cache) TEMPLATE_CACHE.set(builder, cache = new Map());
-
-  // compilation shape may be shared by text; call-site identity belongs to
-  // core, which wraps this result in a separate site record
-  const rawKey = strings.raw
-    ? Array.from(strings.raw, (part) => `${part.length}:${part}`).join('')
-    : String(strings),
-    cached = cache.get(rawKey);
-  if (cached) return cached;
-
   const { fragment, holes } = parseTemplate(strings, builder),
     template = {
       site: strings,
@@ -644,6 +631,5 @@ export function compileTemplate(strings, builder) {
       keySlot: deriveKeySlot(holes),
     };
 
-  cache.set(rawKey, template);
   return template;
 }
