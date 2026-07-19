@@ -34,8 +34,8 @@ function isNameChar(char) {
 function parseTemplate(strings, builder) {
   const fragment = builder.createRoot(),
     holes = [],
-    decodeStatic = builder.decodeStatic ?? (value => value),
-    isVoidElement = builder.isVoidElement ?? (() => false),
+    decodeStatic = builder.decodeStatic?.bind(builder) ?? (value => value),
+    isVoidElement = builder.isVoidElement?.bind(builder) ?? (() => false),
     stack = [{ node: fragment, path: [], childIndex: 0, tag: null }];
 
   let mode = TEMPLATE_PARSER_MODES.TEXT,

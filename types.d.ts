@@ -196,13 +196,28 @@ declare module 'temtie/debug.js' {
 }
 
 declare module 'temtie/builder/dom.js' {
-  export const DOMBuilder: Builder<Node, DocumentFragment>;
-  export const SVGBuilder: Builder<Node, DocumentFragment>;
+  export class DOMBuilder {
+    static voidElements: Set<string>;
+    constructor(document?: Document);
+    readonly document: Document;
+  }
+  export interface DOMBuilder extends Builder<Node, DocumentFragment> {}
+
+  export class SVGBuilder extends DOMBuilder {}
+
+  export const dom: DOMBuilder;
+  export const svg: SVGBuilder;
 }
 
 declare module 'temtie/builder/markup.js' {
-  export const MarkupBuilder: Builder<object, object>;
-  // reads the committed tree into a markup string: every text node and
-  // attribute value escapes on the way out
+  export class MarkupBuilder {
+    static voidElements: Set<string>;
+    serialize(node: object): string;
+  }
+  export interface MarkupBuilder extends Builder<object, object> {}
+
+  export const markup: MarkupBuilder;
+  // reads the default builder's committed tree into a markup string: every
+  // text node and attribute value escapes on the way out
   export function serialize(node: object): string;
 }

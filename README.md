@@ -11,9 +11,9 @@ applies the recorded pass to the medium.
 
 ```js
 import { mount, capture, commit, reset } from 'temtie/core.js';
-import { DOMBuilder } from 'temtie/builder/dom.js';
+import { dom } from 'temtie/builder/dom.js';
 
-const app = mount(document.body, { builders: { html: DOMBuilder } });
+const app = mount(document.body, { builders: { html: dom } });
 
 let items = ['first', 'second'];
 
@@ -60,7 +60,7 @@ pass while the committed output stands, and `reset()` stages emptiness.
 `mount(container, { builders })` creates a target seated on a container.
 
 ```js
-const app = mount(document.body, { builders: { html: DOMBuilder } });
+const app = mount(document.body, { builders: { html: dom } });
 app.html`<main>Hello</main>`;
 commit(app);
 ```
@@ -80,7 +80,7 @@ Captured targets are the composition primitive. They let a parent own layout
 while a child owns its own update cycle:
 
 ```js
-const shell = mount(document.body, { builders: { html: DOMBuilder } });
+const shell = mount(document.body, { builders: { html: dom } });
 const clock = capture();
 
 shell.html`<header>${clock}</header><main>...</main>`;
@@ -174,12 +174,17 @@ child writes — the whole contract is the `Builder` interface in `types.d.ts`.
 Anything that can create, move, and write nodes can be a universe.
 
 ```js
-import { DOMBuilder, SVGBuilder } from 'temtie/builder/dom.js';
+import { DOMBuilder, SVGBuilder, dom, svg } from 'temtie/builder/dom.js';
 
 const app = mount(document.body, {
+  builders: { html: dom, svg },
+});
+
+const frame = document.querySelector('iframe');
+const frameApp = mount(frame.contentDocument.body, {
   builders: {
-    html: DOMBuilder,
-    svg: SVGBuilder,
+    html: new DOMBuilder(frame.contentDocument),
+    svg: new SVGBuilder(frame.contentDocument),
   },
 });
 
@@ -189,6 +194,10 @@ commit(app);
 ```
 
 Each builder key becomes a channel on every target in that universe.
+`DOMBuilder.voidElements` and `SVGBuilder.voidElements` are mutable sets. Copy
+one in a subclass when a document vocabulary needs its own void elements.
+The markup medium follows the same split: `MarkupBuilder` is the class and
+`markup` is its ready-to-use default instance.
 
 ## Template Syntax
 
