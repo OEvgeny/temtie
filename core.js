@@ -8,9 +8,9 @@ const UNSET = Symbol('temtie.unset');
 const VALUE = Symbol.for('temtie.value');
 const ROOT = 'root';
 
-// the hole vocabulary is the matrix's row labels: compilers emit it, DEST
-// answers for it. it lives here because what a hole IS belongs to the
-// core — how one is spelled belongs to whoever compiled the template.
+// the hole kinds are the shared vocabulary between the parser (which emits
+// them) and DEST (which answers for them). they live here because what a
+// hole *is* belongs to the core; how one is spelled is the builder's job.
 export const TEMPLATE_HOLE_TYPES = {
   CHILD: 'child',
   ATTR: 'attr',
@@ -25,13 +25,13 @@ let PASS = 0;
 
 const IDLE = 'idle', STAGED = 'staged', SEALED = 'sealed';
 
-// the core is a matrix of two axes: destinations — how a hole reaches the
-// medium — and occupants — who holds it: a plain value, a body (a target
-// named by a ref), or a contract instance owning a body of its own. a ref
-// that brings a target gives it to the hole, an empty ref inherits the
-// hole's target. render stages, commit settles, and one law covers every
-// ending: out of the medium at commit = disposed. only bodies die — a
-// name interpolated again grows a fresh body.
+// the core turns on two axes. a destination is how a hole reaches the
+// medium; an occupant is what holds it — a plain value, a body (a target
+// named by a ref), or a contract instance with a body of its own. a ref
+// carrying a target lends it to the hole; an empty ref inherits the hole's
+// target. one disposal law covers every occupant: what a commit does not
+// restage leaves the medium. disposal reaches bodies, not names — a name
+// interpolated again grows a fresh body.
 
 /** @type {Mount} */
 export function mount(container, { builders } = {}) {
@@ -56,9 +56,9 @@ export function commit(inst) {
   if (ref.target) commitTarget(ref.target);
 }
 
-// skip() voids an uncommitted pass: the committed DOM stands, everything
-// stays borrowable. until a render calls the target again, commit treats the
-// seal as a wall — nothing the failed pass staged can surface through it.
+// skip() seals the target. commit then treats the seal as a wall — no
+// flush, no descent — so nothing the voided pass staged can surface; the
+// committed output stands and stays borrowable until a render reopens it.
 /** @type {Skip} */
 export function skip(inst) {
   const ref = inst?.[PRIVATE];
@@ -69,8 +69,8 @@ export function skip(inst) {
   target.state = SEALED;
 }
 
-// reset() stages emptiness: the next commit flushes blank, a render before
-// it rebuilds — segments stay borrowable.
+// reset() stages emptiness, not destruction: the committed segments stay
+// borrowable, so a render before the next commit can rebuild over them.
 /** @type {Reset} */
 export function reset(inst) {
   const ref = inst?.[PRIVATE];
@@ -80,9 +80,8 @@ export function reset(inst) {
   call(target, 'reset');
 }
 
-// a pass begins: userland called in — through a channel (render), or via
-// skip()/reset(). a point event, never paired: an opened pass may be
-// re-staged into the next before it ever commits, so nothing closes it.
+// 'call' is a point event, never paired: a pass may be re-staged into the
+// next before it ever commits, so nothing ever closes it.
 function call(target, via = 'render') {
   target.state = STAGED;
   target.pass = ++PASS;
@@ -330,8 +329,8 @@ function resolvePlain(binding) {
 }
 
 function resolveBody(parent, binding, ref) {
-  // a closed hole's host has no marker, so placement among its content is
-  // undefined; an instance body may still anchor there — knowingly
+  // a closed hole has no marker, so its content has no defined placement —
+  // but an instance body may still anchor there (resolveInstance does)
   if (binding.dest.closed)
     throw new Error('temtie/core: a meta hole cannot host a target');
   if (!binding.dest.container)
@@ -443,7 +442,7 @@ function flushEnds(binding, sink = disposeTarget) {
   for (const occupant of batch) end(binding, occupant, sink);
 }
 
-// a dying segment's standing occupant is displaced like any other leaver
+// a disposed segment's standing occupant is displaced like any other leaver
 function sweepSegment(segment, sink) {
   for (const binding of segment.bindings) {
     displace(binding);
@@ -468,8 +467,8 @@ function disposeTarget(target) {
   }
 }
 
-// not borrowed this pass = gone at flush: the buckets drop what the chain
-// sweep shed, by the same stamps
+// a segment not borrowed this pass is dropped at flush; its bucket entry
+// goes too, matched by the same pass stamp
 function pruneBuckets(target) {
   for (const [site, bucket] of target.buckets) {
     if (bucket.pass !== target.pass) {
@@ -530,7 +529,7 @@ function placeTarget(target) {
     place(target, segment, prevEnd);
     prevEnd = segment.end;
   }
-  if (target.head.next) deliver(target); // a virgin body delivers nothing
+  if (target.head.next) deliver(target); // an empty body delivers nothing
 }
 
 function flushTarget(target) {
