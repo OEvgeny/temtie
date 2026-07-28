@@ -342,9 +342,6 @@ function resolveBody(parent, binding, ref) {
       ?? makeTarget(parent.proto, null);
   if (child.anchor?.dest.kind === ROOT)
     throw new Error('temtie/core: a mounted root cannot be interpolated into a template');
-  if (child === parent)
-    throw new Error('temtie/core: a target cannot be interpolated into itself');
-
   if (ref.target !== child) {
     ref.target = child;
     Object.setPrototypeOf(ref.inst, child.proto);
@@ -387,6 +384,9 @@ function resolveInstance(parent, binding, raw, init) {
 
 function hook(parent, child, binding) {
   if (child.anchor === binding) return;
+  for (let cursor = parent; cursor; cursor = cursor.parent)
+    if (cursor === child)
+      throw new Error('temtie/core: a target cannot be anchored beneath its descendant');
   child.parent?.children.delete(child);
   child.parent = parent;
   child.anchor = binding;
@@ -452,8 +452,8 @@ function sweepSegment(segment, sink) {
 
 // a disposed target is left empty but valid: its ref renders again from scratch
 function disposeTarget(target) {
-  const queue = [target], seen = new Set(queue);
-  const sink = (child) => { if (!seen.has(child)) seen.add(child), queue.push(child); };
+  const queue = [target];
+  const sink = (child) => { queue.push(child); };
   for (let index = 0; index < queue.length; index++) {
     const current = queue[index];
     debug.enabled && debug.emit({ type: 'dispose', target: current });
@@ -482,7 +482,8 @@ function pruneBuckets(target) {
 }
 
 // flush only what was staged, parents before children; the queue keeps deep
-// trees off the call stack, the seen set keeps cycles to one visit
+// trees off the call stack. the forest hook() enforces means each target is
+// reachable by one path, so the walk visits each exactly once
 function commitTarget(target) {
   const root = debug.enabled && debug.emit({
     type: 'commit', target, pass: target.pass,
@@ -490,7 +491,7 @@ function commitTarget(target) {
   });
 
   withCause(root, () => {
-    const queue = [target], seen = new Set(queue);
+    const queue = [target];
     for (let index = 0; index < queue.length; index++) {
       const current = queue[index];
       if (current.state === SEALED) { // the wall: no flush, no descent
@@ -499,8 +500,7 @@ function commitTarget(target) {
       }
       if (current.state === STAGED) settle(current, 'flush', flushTarget);
       else if (current.moved) settle(current, 'place', placeTarget);
-      for (const child of current.children)
-        if (!seen.has(child)) seen.add(child), queue.push(child);
+      for (const child of current.children) queue.push(child);
     }
 
     debug.enabled && root && debug.emit({ type: 'settled', target });
