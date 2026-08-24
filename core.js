@@ -210,7 +210,7 @@ function makeSegment(site) {
   }
 
   const bindings = template.holes.map((hole) => makeBinding(builder, fragment, hole));
-  return { template, builder, start, end, bindings, values: [], prev: null, next: null, pass: 0 };
+  return { template, builder, start, end, bindings, values: [], prev: null, next: null, pass: 0, parked: null };
 }
 
 // a child marker never moves and never leaves: content lives after it
@@ -431,7 +431,8 @@ function endBody(body, sink) {
 
 function evictChain(segment) {
   for (; segment; segment = segment.next)
-    if (segment.builder.parent(segment.start)) segment.builder.extract(segment.start, segment.end);
+    if (segment.builder.parent(segment.start))
+      segment.parked = segment.builder.extract(segment.start, segment.end);
 }
 
 // ends fire only at flush: a voided pass frees nothing
@@ -573,13 +574,15 @@ function place(target, segment, prevEnd) {
     after = prevEnd ?? anchor.dest.after?.(anchor);
 
   if (
+    !segment.parked &&
     builder.parent(segment.start) === container &&
     (!after || builder.prev(segment.start) === after)
   ) return;
 
-  debug.enabled && debug.emit({ type: 'move', target, segment, container, after: after ?? null });
-  const content = builder.extract(segment.start, segment.end);
-  builder.insert(container, content, after ? builder.next(after) : null);
+  const content = segment.parked ?? builder.extract(segment.start, segment.end);
+  segment.parked = null;
+  debug.enabled && debug.emit({ type: 'move', target, segment, container, after });
+  builder.insert(container, content, after);
 }
 
 function flushBinding(binding, values) {

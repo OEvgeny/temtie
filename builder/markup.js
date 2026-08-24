@@ -38,7 +38,7 @@ function decodeEntities(text) {
   });
 }
 
-/** @implements {Builder<object, object>} */
+/** @implements {Builder<object, object[], object>} */
 export class MarkupBuilder {
   static voidElements = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
 
@@ -112,10 +112,18 @@ export class MarkupBuilder {
     return siblings ? siblings[siblings.indexOf(node) + 1] ?? null : null;
   }
 
-  insert(parent, content, before = null) {
-    const nodes = content.fragment ? content.children.slice() : [content];
+  insert(parent, content, after = null) {
+    const nodes = [];
+    for (const node of Array.isArray(content) ? content : [content]) {
+      if (node === after) continue;
+      const i = nodes.indexOf(node);
+      if (i >= 0) nodes.splice(i, 1);
+      nodes.push(node);
+    }
+    if (!nodes.length) return;
+
     for (const node of nodes) detach(node);
-    const index = before ? parent.children.indexOf(before) : parent.children.length;
+    const index = after ? parent.children.indexOf(after) + 1 : parent.children.length;
     parent.children.splice(index, 0, ...nodes);
     for (const node of nodes) node.parent = parent;
   }
@@ -124,9 +132,9 @@ export class MarkupBuilder {
     const parent = start.parent,
       from = parent.children.indexOf(start),
       to = parent.children.indexOf(end),
-      fragment = { fragment: true, children: parent.children.splice(from, to - from + 1) };
-    for (const node of fragment.children) node.parent = fragment;
-    return fragment;
+      nodes = parent.children.splice(from, to - from + 1);
+    for (const node of nodes) node.parent = null;
+    return start === end ? nodes[0] : nodes;
   }
 
   remove(start, end) {
@@ -148,8 +156,6 @@ export class MarkupBuilder {
 
   toNodes(value) {
     if (value == null || value === false) return [];
-    if (value?.fragment) return value.children.slice();
-    if (value?.start && value?.end) return this.collectRange(value.start, value.end);
     if (Array.isArray(value)) return value.flatMap(this.toNodes, this);
     if (isIterable(value)) return Array.from(value).flatMap(this.toNodes, this);
     if (typeof value === 'object') return [value];
@@ -159,51 +165,24 @@ export class MarkupBuilder {
   toNode(...values) {
     const nodes = values.flatMap(this.toNodes, this);
     if (nodes.length === 1) return nodes[0];
-    return { fragment: true, children: nodes };
+    return nodes;
   }
 
   setChild(marker, after, value) {
     const parent = marker.parent;
     if (!parent) return after;
 
-    const isPrimitive = value == null ||
-        typeof value === 'string' ||
-        typeof value === 'number' ||
-        typeof value === 'boolean',
+    const next = this.toNodes(value),
       first = after === marker ? null : this.next(marker);
 
-    if (isPrimitive) {
-      const text = value == null || value === false ? '' : String(value);
+    if (first) this.remove(first, after);
 
-      if (text && first === after && 'text' in first) {
-        first.text = text;
-        return after;
-      }
-
-      if (!text) {
-        if (first) this.remove(first, after);
-        return marker;
-      }
-
-      const node = this.createText(text);
-      this.insert(parent, node, first ?? this.next(marker));
-      if (first) this.remove(first, after);
-      return node;
-    }
-
-    const previous = first ? this.collectRange(first, after) : [],
-      next = this.toNodes(value);
-
-    let before = marker.parent.children[marker.parent.children.indexOf(marker) + 1] ?? null,
-      tail = marker;
+    const before = this.next(marker);
+    let tail = marker;
     for (const node of next) {
-      if (node === before) before = this.next(before);
-      else this.insert(parent, node, before);
+      this.insert(parent, node, before ? this.prev(before) : null);
       tail = node;
     }
-    for (const node of previous)
-      if (!next.includes(node)) detach(node);
-
     return tail;
   }
 

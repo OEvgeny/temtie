@@ -3,11 +3,8 @@
 export type PropertyKeyLike = string | number | symbol;
 
 /* Builder contract */
-export interface Builder<Node = unknown, Root = Node> {
-  // syntax belongs to the builder: compile turns a site's statics into a
-  // template. most builders delegate to parser.js's compileTemplate; the
-  // core guarantees one call per site and stamps builder/keySlot if absent
-  compile(strings: TemplateStringsArray): Template<Builder<Node, Root>>;
+export interface Builder<Node = unknown, NodeCollection = unknown[], Root = Node> {
+  compile(strings: TemplateStringsArray): Template<Builder<Node, NodeCollection, Root>>;
   createRoot(): Root;
   decodeStatic?(value: string, context?: 'text' | 'attr'): string;
   isVoidElement?(tag: string): boolean;
@@ -23,31 +20,28 @@ export interface Builder<Node = unknown, Root = Node> {
   lastChild(container: Node | Root): Node | null;
   parent(node: Node): Node | Root | null;
   contains(container: Node | Root, node: Node): boolean;
-  insert(parent: Node | Root, child: Node | Root, before?: Node | null): void;
-  extract(start: Node, end: Node): Node | Root;
+  insert(parent: Node | Root, content: Node | NodeCollection, after?: Node | null): void;
+  extract(start: Node, end: Node): Node | NodeCollection;
   remove(start: Node, end: Node): void;
   next(node: Node): Node | null;
   prev(node: Node): Node | null;
-  // `after` is the tail of the range owned after `marker`; marker itself
-  // means empty. Core returns it only to this builder and marker. Replacing
-  // or clearing the child invalidates the old tail and returns the new one.
   setChild(marker: Node, after: Node, value: Renderable): Node;
-  toNode(...values: Renderable[]): Node | Root;
-  toNodes(value: Renderable): Node[];
-  collectRange(start: Node, end: Node): Node[];
+  toNode(...values: Renderable[]): Node | NodeCollection;
+  toNodes(value: Renderable): NodeCollection;
+  collectRange(start: Node, end: Node): NodeCollection;
 }
 
 export type Builders = object;
 export type BuilderKeys<Bs extends Builders> = {
-  [Name in keyof Bs]: Bs[Name] extends Builder<any, any> ? Name : never;
+  [Name in keyof Bs]: Bs[Name] extends Builder<any, any, any> ? Name : never;
 }[keyof Bs];
-export type AnyBuilderOf<Bs extends Builders> = Extract<Bs[BuilderKeys<Bs>], Builder<any, any>>;
-export type BuilderNode<B> = B extends Builder<infer Node, any> ? Node : never;
-export type BuilderRoot<B> = B extends Builder<any, infer Root> ? Root : never;
+export type AnyBuilderOf<Bs extends Builders> = Extract<Bs[BuilderKeys<Bs>], Builder<any, any, any>>;
+export type BuilderNode<B> = B extends Builder<infer Node, any, any> ? Node : never;
+export type BuilderRoot<B> = B extends Builder<any, any, infer Root> ? Root : never;
 export type RenderContainer<Bs extends Builders> =
   BuilderNode<AnyBuilderOf<Bs>> | BuilderRoot<AnyBuilderOf<Bs>>;
 
-export interface Template<B extends Builder = Builder> {
+export interface Template<B extends Builder<any, any, any> = Builder> {
   readonly site: TemplateStringsArray;
   readonly builder: B;
   readonly fragment: BuilderRoot<B>;
@@ -94,7 +88,7 @@ export type Commit = (instance: Instance<any>) => void;
 export type Skip = (instance: Instance<any>) => void;
 export type Reset = (instance: Instance<any>) => void;
 
-export function compileTemplate<B extends Builder>(
+export function compileTemplate<B extends Builder<any, any, any>>(
   strings: TemplateStringsArray,
   builder: B
 ): Template<B>;
@@ -172,8 +166,8 @@ export interface DebugHub {
 
 /* Default builder set */
 export interface DefaultBuilders {
-  html: Builder<Node, DocumentFragment>;
-  svg: Builder<Node, DocumentFragment>;
+  html: Builder<Node, Node[], DocumentFragment>;
+  svg: Builder<Node, Node[], DocumentFragment>;
 }
 
 declare module 'temtie/core.js' {
@@ -201,7 +195,7 @@ declare module 'temtie/builder/dom.js' {
     constructor(document?: Document);
     readonly document: Document;
   }
-  export interface DOMBuilder extends Builder<Node, DocumentFragment> {}
+  export interface DOMBuilder extends Builder<Node, Node[], DocumentFragment> {}
 
   export class SVGBuilder extends DOMBuilder {}
 
@@ -214,7 +208,7 @@ declare module 'temtie/builder/markup.js' {
     static voidElements: Set<string>;
     serialize(node: object): string;
   }
-  export interface MarkupBuilder extends Builder<object, object> {}
+  export interface MarkupBuilder extends Builder<object, object[], object> {}
 
   export const markup: MarkupBuilder;
   // reads the default builder's committed tree into a markup string: every

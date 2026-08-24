@@ -22,11 +22,7 @@ function shouldSetProperty(node, name) {
   );
 }
 
-function setText(node, text) {
-  if (node.nodeValue !== text) node.nodeValue = text;
-}
-
-/** @implements {Builder<Node, DocumentFragment>} */
+/** @implements {Builder<Node, Node[], DocumentFragment>} */
 export class DOMBuilder {
   #decoder = null;
 
@@ -121,13 +117,14 @@ export class DOMBuilder {
       : false;
   }
 
-  insert(parent, child, before = null) {
-    if (before) {
-      parent.insertBefore(child, before);
-      return;
+  insert(parent, content, after = null) {
+    if (Array.isArray(content)) {
+      const fragment = this.document.createDocumentFragment();
+      fragment.append(...content);
+      content = fragment;
     }
 
-    parent.append(child);
+    parent.insertBefore(content, after?.nextSibling ?? null);
   }
 
   extract(start, end) {
@@ -139,7 +136,8 @@ export class DOMBuilder {
     const range = (start.ownerDocument ?? this.document).createRange();
     range.setStartBefore(start);
     range.setEndAfter(end);
-    return range.extractContents();
+    const fragment = range.extractContents();
+    return Array.from(fragment.childNodes);
   }
 
   remove(start, end) {
@@ -194,12 +192,6 @@ export class DOMBuilder {
     if (value == null || value === false) return [];
     if (isDomNode(value))
       return value.nodeType === 11 ? Array.from(value.childNodes) : [value];
-    if (
-      typeof value === 'object' &&
-      value &&
-      isDomNode(value.start) &&
-      isDomNode(value.end)
-    ) return this.collectRange(value.start, value.end);
     if (Array.isArray(value))
       return value.flatMap(this.toNodes, this);
     if (isIterable(value))
@@ -210,57 +202,25 @@ export class DOMBuilder {
   toNode(...values) {
     const nodes = values.flatMap(this.toNodes, this);
     if (nodes.length === 1) return nodes[0];
-
-    const fragment = this.document.createDocumentFragment();
-    fragment.append(...nodes);
-    return fragment;
+    return nodes;
   }
 
-  // The marker is the permanent left anchor; `after` is the range's current
-  // tail, with marker itself spelling empty. Replacement may retain and reorder
-  // owned nodes, but releases every node left outside the next range.
+  // the marker anchors the range and survives every replacement
   setChild(marker, after, value) {
     const parent = marker.parentNode;
     if (!parent) return after;
 
-    const isPrimitive = value == null ||
-        typeof value === 'string' ||
-        typeof value === 'number' ||
-        typeof value === 'boolean',
+    const next = this.toNodes(value),
       first = after === marker ? null : marker.nextSibling;
 
-    if (isPrimitive) {
-      const text = value == null || value === false ? '' : String(value);
+    if (first) this.remove(first, after);
 
-      if (text && first === after && first.nodeType === 3) {
-        setText(first, text);
-        return after;
-      }
-
-      if (!text) {
-        if (first) this.remove(first, after);
-        return marker;
-      }
-
-      const node = this.createText(text);
-      parent.insertBefore(node, first ?? marker.nextSibling);
-      if (first) this.remove(first, after);
-      return node;
-    }
-
-    const previous = first ? this.collectRange(first, after) : [],
-      next = this.toNodes(value);
-
-    let before = marker.nextSibling,
-      tail = marker;
+    const before = marker.nextSibling;
+    let tail = marker;
     for (const node of next) {
-      if (node === before) before = before.nextSibling;
-      else parent.insertBefore(node, before);
+      parent.insertBefore(node, before);
       tail = node;
     }
-    for (const node of previous)
-      if (!next.includes(node)) node.parentNode?.removeChild(node);
-
     return tail;
   }
 }
