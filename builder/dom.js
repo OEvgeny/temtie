@@ -5,6 +5,9 @@ import { compileTemplate } from '../parser.js';
 
 const SVG_NAMESPACE = 'http://www.w3.org/2000/svg';
 const TEMTIE_PROP_NAMES = Symbol.for('temtie.propNames');
+// marks a text node setChild made from a value: only such a node is its to
+// rewrite in place. toNode() output is the caller's once handed back
+const OWN_TEXT = Symbol('temtie.ownText');
 
 function isDomNode(value) {
   return !!value && typeof value === 'object' && typeof value.nodeType === 'number';
@@ -210,8 +213,15 @@ export class DOMBuilder {
     const parent = marker.parentNode;
     if (!parent) return after;
 
-    const next = this.toNodes(value),
-      first = after === marker ? null : marker.nextSibling;
+    const first = after === marker ? null : marker.nextSibling,
+      text = typeof value === 'string' || typeof value === 'number';
+    if (text && first === after && first?.[OWN_TEXT]) {
+      first.data = String(value);
+      return first;
+    }
+
+    const next = this.toNodes(value);
+    if (text) next[0][OWN_TEXT] = true;
 
     if (first) this.remove(first, after);
 
