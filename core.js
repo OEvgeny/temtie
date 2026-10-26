@@ -312,10 +312,15 @@ const DEST = {
 function resolveSegment(target, segment, values) {
   segment.values = values;
   for (const binding of segment.bindings) {
-    const raw = values[binding.slot],
-      init = raw?.[VALUE];
+    const raw = values[binding.slot];
+    // a primitive carries no contract and no target
+    if (raw === null || (typeof raw !== 'object' && typeof raw !== 'function')) {
+      resolvePlain(binding);
+      continue;
+    }
+    const init = raw[VALUE];
     if (init !== undefined) resolveInstance(target, binding, raw, init);
-    else if (raw?.[PRIVATE]) resolveBody(target, binding, raw[PRIVATE]);
+    else if (raw[PRIVATE]) resolveBody(target, binding, raw[PRIVATE]);
     else resolvePlain(binding);
   }
 }
