@@ -210,7 +210,7 @@ function makeSegment(site) {
   }
 
   const bindings = template.holes.map((hole) => makeBinding(builder, fragment, hole));
-  return { template, builder, start, end, bindings, values: [], prev: null, next: null, pass: 0, parked: null };
+  return { template, builder, start, end, bindings, values: [], prev: null, next: null, pass: 0, parked: null, sunk: false };
 }
 
 // a child marker never moves and never leaves: content lives after it
@@ -237,6 +237,18 @@ function makeBinding(builder, fragment, hole) {
 function emit(target, segment) {
   if (segment === target.cursor) return;
   segment.pass = target.pass;
+  // one segment standing between the cursor and the emitted one has sunk:
+  // it steps behind, so the rest of the chain stays where it is
+  const ahead = target.cursor.next;
+  if (ahead && ahead !== segment && ahead.next === segment) {
+    ahead.next = segment.next;
+    if (segment.next) segment.next.prev = ahead;
+    segment.prev = target.cursor;
+    segment.next = ahead;
+    ahead.prev = segment;
+    target.cursor.next = segment;
+    ahead.sunk = true;
+  }
   if (target.cursor.next === segment) {
     target.cursor = segment;
     return;
@@ -435,9 +447,12 @@ function endBody(body, sink) {
 }
 
 function evictChain(segment) {
-  for (; segment; segment = segment.next)
-    if (segment.builder.parent(segment.start))
-      segment.parked = segment.builder.extract(segment.start, segment.end);
+  for (; segment; segment = segment.next) park(segment);
+}
+
+function park(segment) {
+  if (segment.builder.parent(segment.start))
+    segment.parked = segment.builder.extract(segment.start, segment.end);
 }
 
 // ends fire only at flush: a voided pass frees nothing
@@ -544,23 +559,28 @@ function flushTarget(target) {
   target.moved = false;
   flushEnds(target.anchor);
 
+  // what leaves and what sank step out first: left in the medium, either
+  // would make every segment after it look out of place
   const boundary = target.cursor;
-  if (boundary !== target.head) {
-    let prevEnd = null;
-    for (let segment = target.head.next; ; segment = segment.next) {
-      place(target, segment, prevEnd);
-      for (const binding of segment.bindings) flushBinding(binding, segment.values);
-      prevEnd = segment.end;
-      if (segment === boundary) break;
-    }
-  }
-
   for (let segment = boundary.next; segment; segment = segment.next) {
     debug.enabled && debug.emit({ type: 'drop', target, segment });
     if (segment.builder.parent(segment.start)) segment.builder.extract(segment.start, segment.end);
     sweepSegment(segment, disposeTarget);
   }
   boundary.next = null;
+
+  for (let segment = target.head.next; segment; segment = segment.next)
+    if (segment.sunk) {
+      segment.sunk = false;
+      park(segment);
+    }
+
+  let prevEnd = null;
+  for (let segment = target.head.next; segment; segment = segment.next) {
+    place(target, segment, prevEnd);
+    for (const binding of segment.bindings) flushBinding(binding, segment.values);
+    prevEnd = segment.end;
+  }
   pruneBuckets(target);
   deliver(target);
 }
