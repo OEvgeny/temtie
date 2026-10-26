@@ -273,6 +273,14 @@ const DEST = {
   [ROOT]: {
     kind: ROOT,
     container: (anchor) => anchor.node,
+    // a root lays one marker after whatever the container already holds, so
+    // its first segment sits after an anchor like every other segment does.
+    // the container is the caller's: a marker it lost is laid again
+    after(anchor, builder) {
+      if (!anchor.marker || builder.parent(anchor.marker) !== anchor.node)
+        anchor.marker = lay(anchor, builder);
+      return anchor.marker;
+    },
   },
   [HOLE.CHILD]: {
     kind: HOLE.CHILD,
@@ -320,6 +328,12 @@ const DEST = {
     }
   }
 };
+
+function lay(anchor, builder) {
+  const marker = builder.createMarker();
+  builder.insert(anchor.node, marker, null);
+  return marker;
+}
 
 function resolveSegment(target, segment, values) {
   segment.values = values;
@@ -592,19 +606,19 @@ function deliver(target) {
   anchor.dest.deliver(anchor);
 }
 
+// a segment right behind its anchor shares the anchor's container, so one
+// read settles the common case; only an anchorless start asks for the parent
 function place(target, segment, prevEnd) {
   const builder = segment.builder,
     anchor = target.anchor,
-    container = anchor.dest.container(anchor),
-    after = prevEnd ?? anchor.dest.after?.(anchor);
+    after = prevEnd ?? anchor.dest.after?.(anchor, builder);
 
-  if (
-    !segment.parked &&
-    builder.parent(segment.start) === container &&
-    (!after || builder.prev(segment.start) === after)
-  ) return;
+  if (!segment.parked && (after
+    ? builder.prev(segment.start) === after
+    : builder.parent(segment.start) === anchor.dest.container(anchor))) return;
 
-  const content = segment.parked ?? builder.extract(segment.start, segment.end);
+  const container = anchor.dest.container(anchor),
+    content = segment.parked ?? builder.extract(segment.start, segment.end);
   segment.parked = null;
   debug.enabled && debug.emit({ type: 'move', target, segment, container, after });
   builder.insert(container, content, after);
