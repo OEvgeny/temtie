@@ -208,7 +208,9 @@ The parser is intentionally small and strict — malformed templates throw a
 - Quoted dynamic attributes are rejected: `class="${name}"`.
 - Spread props use `...${props}` inside an opening tag.
 - `#key${value}` keys the segment; it belongs on a root element of the
-  template and never reaches the medium.
+  template and never reaches the medium. `undefined`, `null`, `true` and
+  `false` carry no identity, so a row that takes one of them is matched by
+  its position in the pass rather than by a key.
 - Text in child slots is text, not HTML.
 - Whether `<input>` may omit its closing is the builder's call
   (`isVoidElement`); `DOMBuilder` knows HTML's void set.

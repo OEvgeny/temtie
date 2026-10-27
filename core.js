@@ -178,6 +178,12 @@ function touch(target) {
   call(target);
 }
 
+// four values carry no identity: a channel that carries one of them is an
+// occurrence matched by position, never a row held under a key. Every other
+// value keys, `0`, `''` and `NaN` included, and a value that keys once keys the
+// same way in every pass.
+const carriesIdentity = (key) => key !== undefined && key !== null && key !== true && key !== false;
+
 function takeSegment(target, site, values) {
   const template = site.template;
   let bucket = target.buckets.get(site);
@@ -188,10 +194,11 @@ function takeSegment(target, site, values) {
   }
 
   const key = template.keySlot >= 0 ? values[template.keySlot] : undefined;
-  let segment = key !== undefined ? bucket.byKey.get(key) : bucket.byIndex[++bucket.used];
+  const keyed = carriesIdentity(key);
+  let segment = keyed ? bucket.byKey.get(key) : bucket.byIndex[++bucket.used];
   if (!segment) {
     segment = makeSegment(site);
-    if (key !== undefined) bucket.byKey.set(key, segment);
+    if (keyed) bucket.byKey.set(key, segment);
     else bucket.byIndex[bucket.used] = segment;
   }
   return segment;
