@@ -5,30 +5,55 @@ import { TEMPLATE_HOLE_TYPES } from './core.js';
 
 export { TEMPLATE_HOLE_TYPES };
 
-const TEMPLATE_PARSER_MODES = {
-  TEXT: 'TEXT',
-  TAG_OPEN: 'TAG_OPEN',
-  TAG_NAME: 'TAG_NAME',
-  IN_TAG: 'IN_TAG',
-  ATTR_NAME: 'ATTR_NAME',
-  ATTR_EQ: 'ATTR_EQ',
-  ATTR_VALUE: 'ATTR_VALUE',
-  CLOSE_TAG: 'CLOSE_TAG',
-  SELF_CLOSE: 'SELF_CLOSE',
-};
+// where the scan stands when a static ends. only TEXT and IN_TAG carry over
+// a hole; every other mode there is a hole kind or a syntax error
+const TEXT = 0, TAG_OPEN = 1, TAG_NAME = 2, IN_TAG = 3, ATTR_NAME = 4,
+  ATTR_EQ = 5, ATTR_VALUE = 6, CLOSE_TAG = 7, SELF_CLOSE = 8;
 
-const NAME_DELIMITER_RE = /[\s"'<>/=]/;
+const ERROR = 'temtie/parser syntax error: ';
 
-function isWhitespace(char) {
-  return /\s/.test(char);
+// ASCII classes: /\s/, and the characters that end a name, /[\s"'<>/=]/
+const SPACE = 1, DELIMITER = 2;
+const ASCII = new Uint8Array(128);
+for (const c of '\t\n\v\f\r ') ASCII[c.charCodeAt(0)] = SPACE | DELIMITER;
+for (const c of `"'<>=/`) ASCII[c.charCodeAt(0)] = DELIMITER;
+
+// /\s/ past ASCII
+function isWideSpace(c) {
+  return c === 0xa0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) || c === 0x2028 ||
+    c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff;
 }
 
-function isNameStart(char) {
-  return !!char && !NAME_DELIMITER_RE.test(char) && char !== '/' && !/[0-9]/.test(char);
+function isSpace(c) {
+  return c < 128 ? (ASCII[c] & SPACE) !== 0 : isWideSpace(c);
 }
 
-function isNameChar(char) {
-  return !!char && !NAME_DELIMITER_RE.test(char) && char !== '/';
+function isNameChar(c) {
+  return c < 128 ? (ASCII[c] & DELIMITER) === 0 : !isWideSpace(c);
+}
+
+function isNameStart(c) {
+  return (c < 48 || c > 57) && isNameChar(c);
+}
+
+// names under # belong to the core. #key is the only resident, and it
+// exists only as a meta hole — nothing in the namespace may reach the
+// medium, statically or through a prop hole
+function assertCoreName(name, meta) {
+  if (name[0] !== '#') return;
+
+  if (!meta)
+    throw new SyntaxError(
+      name === '#key'
+        ? `${ERROR}#key takes an interpolated value: #key\${value}`
+        : `${ERROR}unknown reserved prop "${name}"`);
+
+  if (name !== '#key')
+    throw new SyntaxError(`${ERROR}unknown reserved meta-prop "${name}"`);
+}
+
+function spreadWithoutHole() {
+  return new SyntaxError(`${ERROR}spread syntax must be followed by interpolation`);
 }
 
 function parseTemplate(strings, builder) {
@@ -38,543 +63,413 @@ function parseTemplate(strings, builder) {
     isVoidElement = builder.isVoidElement?.bind(builder) ?? (() => false),
     stack = [{ node: fragment, path: [], childIndex: 0, tag: null }];
 
-  let mode = TEMPLATE_PARSER_MODES.TEXT,
-    textBuffer = '',
-    nameBuffer = '',
-    pendingNode = null,
+  let ctx = stack[0],
+    pending = null,
     pendingPath = null,
-    pendingTagName = '',
-    pendingAttrNames = null,
-    pendingMetaNames = null,
-    attrName = '',
-    attrValue = '',
-    attrQuote = '',
-    closeTagWhitespaceOnly = false,
-    spreadDots = 0,
+    pendingTag = '',
+    attrNames = null,
+    metaNames = null,
     lastHoleMarker = null;
 
-  function flushText() {
-    if (!textBuffer) return;
-
-    const ctx = stack.at(-1);
-    builder.insert(
-      ctx.node,
-      builder.createText(decodeStatic(textBuffer, 'text'))
-    );
+  function insertText(text) {
+    builder.insert(ctx.node, builder.createText(decodeStatic(text, 'text')));
     ctx.childIndex++;
-    textBuffer = '';
   }
 
-  function openPendingTag(tagName) {
-    const ctx = stack.at(-1);
-
-    pendingNode = builder.createElement(tagName);
+  function openTag(tag) {
+    pending = builder.createElement(tag);
     pendingPath = [...ctx.path, ctx.childIndex];
-    pendingTagName = tagName;
-    pendingAttrNames = new Set();
-    pendingMetaNames = new Set();
+    pendingTag = tag;
+    attrNames = [];
+    metaNames = [];
   }
 
-  function commitPendingTag() {
-    if (!pendingNode)
-      throw new SyntaxError('temtie/parser syntax error: missing pending tag to commit');
-
-    if (isVoidElement(pendingTagName)) return commitSelfClosingTag();
-
-    const ctx = stack.at(-1);
-    builder.insert(ctx.node, pendingNode);
+  function placeTag(opens) {
+    builder.insert(ctx.node, pending);
     ctx.childIndex++;
-
-    stack.push({
-      node: pendingNode,
-      path: pendingPath,
-      childIndex: 0,
-      tag: pendingTagName,
-    });
-
-    pendingNode = null;
-    pendingPath = null;
-    pendingTagName = '';
-    pendingAttrNames = null;
-    pendingMetaNames = null;
-    spreadDots = 0;
+    if (opens) stack.push(ctx = { node: pending, path: pendingPath, childIndex: 0, tag: pendingTag });
+    pending = null;
   }
 
-  function commitSelfClosingTag() {
-    if (!pendingNode)
-      throw new SyntaxError('temtie/parser syntax error: self-closing tag has no pending element');
-
-    const ctx = stack.at(-1);
-    builder.insert(ctx.node, pendingNode);
-    ctx.childIndex++;
-
-    pendingNode = null;
-    pendingPath = null;
-    pendingTagName = '';
-    pendingAttrNames = null;
-    pendingMetaNames = null;
-    spreadDots = 0;
+  function commitTag() {
+    placeTag(!isVoidElement(pendingTag));
   }
 
-  function assertUniqueName(names, name, namespace) {
-    if (names?.has(name))
-      throw new SyntaxError(`temtie/parser syntax error: duplicate ${namespace} "${name}" in <${pendingTagName}>`);
+  function claimName(names, name, kind) {
+    if (names.includes(name))
+      throw new SyntaxError(`${ERROR}duplicate ${kind} "${name}" in <${pendingTag}>`);
 
-    names?.add(name);
-  }
-
-  function closeCurrentTag(tagName) {
-    if (stack.length === 1)
-      throw new SyntaxError(`temtie/parser syntax error: stray closing tag </${tagName}>`);
-
-    const ctx = stack.at(-1);
-
-    if (ctx.tag !== tagName)
-      throw new SyntaxError(`temtie/parser syntax error: mismatched closing tag </${tagName}>; expected </${ctx.tag}>`);
-
-    stack.pop();
-  }
-
-  // names under # belong to the core. #key is the only resident, and it
-  // exists only as a meta hole — nothing in the namespace may reach the
-  // medium, statically or through a prop hole
-  function assertCoreName(name, meta) {
-    if (name[0] !== '#') return;
-
-    if (!meta)
-      throw new SyntaxError(
-        name === '#key'
-          ? 'temtie/parser syntax error: #key takes an interpolated value: #key${value}'
-          : `temtie/parser syntax error: unknown reserved prop "${name}"`);
-
-    if (name !== '#key')
-      throw new SyntaxError(`temtie/parser syntax error: unknown reserved meta-prop "${name}"`);
+    names.push(name);
   }
 
   function setStaticProp(name, value) {
-    if (!pendingNode)
-      throw new SyntaxError(`temtie/parser syntax error: cannot set static attribute "${name}" without an open tag`);
-
     assertCoreName(name, false);
-    assertUniqueName(pendingAttrNames, name, 'attribute');
-
-    const decoded =
-      typeof value === 'string'
-        ? decodeStatic(value, 'attr')
-        : value;
-
-    builder.setProp(pendingNode, name, decoded);
+    claimName(attrNames, name, 'attribute');
+    builder.setProp(pending, name, value === true ? value : decodeStatic(value, 'attr'));
   }
 
-  // a child hole is a single marker: a permanent anchor that content lands
-  // after, referenced only while the hole has no content to speak for it
-  function emitChildHole(slot) {
-    flushText();
+  function closeTag(tag) {
+    if (stack.length === 1)
+      throw new SyntaxError(`${ERROR}stray closing tag </${tag}>`);
 
-    const ctx = stack.at(-1),
-      marker = builder.createMarker();
-    builder.insert(ctx.node, marker);
+    if (ctx.tag !== tag)
+      throw new SyntaxError(`${ERROR}mismatched closing tag </${tag}>; expected </${ctx.tag}>`);
 
-    holes.push({
-      type: TEMPLATE_HOLE_TYPES.CHILD,
-      slot,
-      path: [...ctx.path, ctx.childIndex],
-    });
-
-    if (ctx.node === fragment) lastHoleMarker = marker;
-    ctx.childIndex += 1;
+    stack.pop();
+    ctx = stack[stack.length - 1];
   }
 
-  function emitAttrHole(slot) {
-    assertCoreName(attrName, false);
-    assertUniqueName(pendingAttrNames, attrName, 'attribute');
-
-    holes.push({
-      type: TEMPLATE_HOLE_TYPES.ATTR,
-      slot,
-      path: pendingPath,
-      prop: attrName,
-    });
-
-    attrName = '';
-    attrValue = '';
-    attrQuote = '';
-    mode = TEMPLATE_PARSER_MODES.IN_TAG;
-  }
-
-  function emitMetaHole(slot) {
-    assertCoreName(attrName, true);
-    assertUniqueName(pendingMetaNames, attrName, 'metadata');
-
-    holes.push({
-      type: TEMPLATE_HOLE_TYPES.META,
-      slot,
-      path: pendingPath,
-      name: attrName,
-    });
-
-    attrName = '';
-    attrValue = '';
-    attrQuote = '';
-    mode = TEMPLATE_PARSER_MODES.IN_TAG;
-  }
-
-  function emitSpreadHole(slot) {
-    holes.push({
-      type: TEMPLATE_HOLE_TYPES.SPREAD,
-      slot,
-      path: pendingPath,
-    });
-
-    spreadDots = 0;
-  }
-
-  function handleInterpolation(slot) {
-    switch (mode) {
-      case TEMPLATE_PARSER_MODES.TEXT:
-        emitChildHole(slot);
-        return;
-
-      case TEMPLATE_PARSER_MODES.IN_TAG:
-        if (spreadDots === 3) {
-          emitSpreadHole(slot);
-          return;
-        }
-
-        if (spreadDots !== 0)
-          throw new SyntaxError('temtie/parser syntax error: spread syntax requires exact `...` immediately before interpolation');
-
-        throw new SyntaxError('temtie/parser syntax error: bare interpolation inside a tag is not supported');
-
-      case TEMPLATE_PARSER_MODES.ATTR_EQ:
-        emitAttrHole(slot);
-        return;
-
-      case TEMPLATE_PARSER_MODES.ATTR_NAME:
-        emitMetaHole(slot);
-        return;
-
-      case TEMPLATE_PARSER_MODES.ATTR_VALUE:
-        if (attrQuote) {
-          if (!attrValue)
-            throw new SyntaxError(`temtie/parser syntax error: quoted dynamic attribute ${attrName} is not supported; write ${attrName}=\${value} without quotes`);
-
-          throw new SyntaxError(`temtie/parser syntax error: partial interpolation inside quoted attribute "${attrName}" is not supported`);
-        }
-        throw new SyntaxError(`temtie/parser syntax error: partial interpolation inside unquoted attribute "${attrName}" is not supported`);
-      case TEMPLATE_PARSER_MODES.TAG_OPEN:
-        throw new SyntaxError('temtie/parser syntax error: interpolation is not allowed immediately after `<`');
-      case TEMPLATE_PARSER_MODES.TAG_NAME:
-        throw new SyntaxError(`temtie/parser syntax error: interpolation is not allowed inside tag name "${nameBuffer}"`);
-      case TEMPLATE_PARSER_MODES.CLOSE_TAG:
-        throw new SyntaxError('temtie/parser syntax error: interpolation is not allowed inside a closing tag');
-      case TEMPLATE_PARSER_MODES.SELF_CLOSE:
-        throw new SyntaxError('temtie/parser syntax error: interpolation is not allowed inside self-closing syntax');
-    }
-  }
+  let mode = TEXT,
+    spreadDots = 0,
+    quote = '',
+    nameStart = -1,
+    nameEnd = -1,
+    attrStart = 0,
+    attrName = '',
+    valueStart = 0,
+    part = '';
 
   for (let i = 0; i < strings.length; i++) {
-    const part = strings[i];
+    part = strings[i];
+    const length = part.length;
+    let j = 0;
 
-    for (let j = 0; j < part.length; j++) {
-      const char = part[j];
-
+    // each case consumes a run, not a character; when a run reaches the end of
+    // the static, `mode` says what was cut. TAG_NAME and ATTR_NAME only ever
+    // mean "cut" — the hole that follows is answered below, never here
+    while (j < length) {
       switch (mode) {
-        case TEMPLATE_PARSER_MODES.TEXT:
-          if (char === '<') {
-            flushText();
-            mode = TEMPLATE_PARSER_MODES.TAG_OPEN;
-            nameBuffer = '';
+        case TEXT: {
+          let end = part.indexOf('<', j);
+          if (end < 0) end = length;
+          else mode = TAG_OPEN;
+
+          if (end > j) insertText(part.slice(j, end));
+          j = end + 1;
+          break;
+        }
+
+        case TAG_OPEN: {
+          let c = part.charCodeAt(j);
+          if (c === 47) {
+            mode = CLOSE_TAG;
+            nameStart = -1;
+            j++;
+            break;
+          }
+
+          if (!isNameStart(c))
+            throw new SyntaxError(`${ERROR}invalid tag start after "<": "${part[j]}"`);
+
+          nameStart = j;
+          do j++; while (j < length && isNameChar(c = part.charCodeAt(j)));
+
+          if (j === length) {
+            mode = TAG_NAME;
+            break;
+          }
+
+          const tag = part.slice(nameStart, j);
+
+          if (c === 62) {
+            openTag(tag);
+            commitTag();
+            mode = TEXT;
+          } else if (c === 47) {
+            openTag(tag);
+            mode = SELF_CLOSE;
+          } else if (isSpace(c)) {
+            openTag(tag);
+            spreadDots = 0;
+            mode = IN_TAG;
           } else {
-            textBuffer += char;
-          }
-          break;
-
-        case TEMPLATE_PARSER_MODES.TAG_OPEN:
-          if (char === '/') {
-            mode = TEMPLATE_PARSER_MODES.CLOSE_TAG;
-            nameBuffer = '';
-            closeTagWhitespaceOnly = false;
-            break;
+            throw new SyntaxError(`${ERROR}invalid character "${part[j]}" in tag name`);
           }
 
-          if (!isNameStart(char))
-            throw new SyntaxError(`temtie/parser syntax error: invalid tag start after "<": "${char}"`);
-
-          nameBuffer = char;
-          mode = TEMPLATE_PARSER_MODES.TAG_NAME;
+          j++;
           break;
+        }
 
-        case TEMPLATE_PARSER_MODES.TAG_NAME:
-          if (isWhitespace(char)) {
-            openPendingTag(nameBuffer);
-            nameBuffer = '';
+        case IN_TAG: {
+          let c = part.charCodeAt(j);
+
+          if (isSpace(c)) {
+            if (spreadDots === 3) throw spreadWithoutHole();
             spreadDots = 0;
-            mode = TEMPLATE_PARSER_MODES.IN_TAG;
+            do j++; while (j < length && isSpace(part.charCodeAt(j)));
             break;
           }
 
-          if (char === '>') {
-            openPendingTag(nameBuffer);
-            nameBuffer = '';
-            commitPendingTag();
-            mode = TEMPLATE_PARSER_MODES.TEXT;
+          if (c === 62 || c === 47) {
+            if (spreadDots !== 0) throw spreadWithoutHole();
+
+            if (c === 62) {
+              commitTag();
+              mode = TEXT;
+            } else {
+              mode = SELF_CLOSE;
+            }
+
+            j++;
             break;
           }
 
-          if (char === '/') {
-            openPendingTag(nameBuffer);
-            nameBuffer = '';
-            mode = TEMPLATE_PARSER_MODES.SELF_CLOSE;
-            break;
-          }
+          if (c === 46) {
+            if (++spreadDots > 3)
+              throw new SyntaxError(`${ERROR}spread syntax uses exactly three dots`);
 
-          if (!isNameChar(char))
-            throw new SyntaxError(`temtie/parser syntax error: invalid character "${char}" in tag name`);
-
-          nameBuffer += char;
-          break;
-
-        case TEMPLATE_PARSER_MODES.IN_TAG:
-          if (isWhitespace(char)) {
-            if (spreadDots === 3)
-              throw new SyntaxError('temtie/parser syntax error: spread syntax must be followed by interpolation');
-
-            spreadDots = 0;
-            break;
-          }
-
-          if (char === '>') {
-            if (spreadDots !== 0)
-              throw new SyntaxError('temtie/parser syntax error: spread syntax must be followed by interpolation');
-
-            commitPendingTag();
-            mode = TEMPLATE_PARSER_MODES.TEXT;
-            break;
-          }
-
-          if (char === '/') {
-            if (spreadDots !== 0)
-              throw new SyntaxError('temtie/parser syntax error: spread syntax must be followed by interpolation');
-
-            mode = TEMPLATE_PARSER_MODES.SELF_CLOSE;
-            break;
-          }
-
-          if (char === '.') {
-            spreadDots++;
-            if (spreadDots > 3)
-              throw new SyntaxError('temtie/parser syntax error: spread syntax uses exactly three dots');
-
+            j++;
             break;
           }
 
           if (spreadDots !== 0) {
-            if (spreadDots === 3)
-              throw new SyntaxError('temtie/parser syntax error: spread syntax must be followed by interpolation');
+            if (spreadDots === 3) throw spreadWithoutHole();
 
-            attrName = '.'.repeat(spreadDots) + char;
+            // dots short of a spread open the name: `..x` is a name
+            attrStart = j - spreadDots;
             spreadDots = 0;
 
-            if (!isNameChar(char))
-              throw new SyntaxError(`temtie/parser syntax error: invalid character "${char}" in attribute name`);
+            if (!isNameChar(c))
+              throw new SyntaxError(`${ERROR}invalid character "${part[j]}" in attribute name`);
+          } else if (!isNameStart(c)) {
+            throw new SyntaxError(`${ERROR}invalid attribute name start "${part[j]}"`);
+          } else {
+            attrStart = j;
+          }
 
-            mode = TEMPLATE_PARSER_MODES.ATTR_NAME;
+          do j++; while (j < length && isNameChar(c = part.charCodeAt(j)));
+
+          if (j === length) {
+            mode = ATTR_NAME;
             break;
           }
 
-          if (!isNameStart(char))
-            throw new SyntaxError(`temtie/parser syntax error: invalid attribute name start "${char}"`);
+          const name = part.slice(attrStart, j);
 
-          attrName = char;
-          mode = TEMPLATE_PARSER_MODES.ATTR_NAME;
+          if (c === 61) {
+            attrName = name;
+            mode = ATTR_EQ;
+          } else if (c === 62) {
+            setStaticProp(name, true);
+            commitTag();
+            mode = TEXT;
+          } else if (c === 47) {
+            setStaticProp(name, true);
+            mode = SELF_CLOSE;
+          } else if (isSpace(c)) {
+            setStaticProp(name, true);
+          } else {
+            throw new SyntaxError(`${ERROR}invalid character "${part[j]}" in attribute name`);
+          }
+
+          j++;
           break;
+        }
 
-        case TEMPLATE_PARSER_MODES.ATTR_NAME:
-          if (char === '=') {
-            attrValue = '';
-            attrQuote = '';
-            mode = TEMPLATE_PARSER_MODES.ATTR_EQ;
-            break;
+        case ATTR_EQ: {
+          const c = part.charCodeAt(j);
+
+          if (isSpace(c)) {
+            do j++; while (j < length && isSpace(part.charCodeAt(j)));
+          } else if (c === 34 || c === 39) {
+            quote = part[j];
+            valueStart = ++j;
+            mode = ATTR_VALUE;
+          } else if (c === 62 || c === 47) {
+            throw new SyntaxError(`${ERROR}attribute "${attrName}" is missing a value`);
+          } else {
+            quote = '';
+            valueStart = j++;
+            mode = ATTR_VALUE;
           }
 
-          if (isWhitespace(char)) {
-            setStaticProp(attrName, true);
-            attrName = '';
-            spreadDots = 0;
-            mode = TEMPLATE_PARSER_MODES.IN_TAG;
-            break;
-          }
-
-          if (char === '>') {
-            setStaticProp(attrName, true);
-            attrName = '';
-            commitPendingTag();
-            mode = TEMPLATE_PARSER_MODES.TEXT;
-            break;
-          }
-
-          if (char === '/') {
-            setStaticProp(attrName, true);
-            attrName = '';
-            mode = TEMPLATE_PARSER_MODES.SELF_CLOSE;
-            break;
-          }
-
-          if (!isNameChar(char))
-            throw new SyntaxError(`temtie/parser syntax error: invalid character "${char}" in attribute name`);
-
-          attrName += char;
           break;
+        }
 
-        case TEMPLATE_PARSER_MODES.ATTR_EQ:
-          if (isWhitespace(char)) break;
-
-          if (char === '"' || char === "'") {
-            attrQuote = char;
-            attrValue = '';
-            mode = TEMPLATE_PARSER_MODES.ATTR_VALUE;
-            break;
-          }
-
-          if (char === '>' || char === '/')
-            throw new SyntaxError(`temtie/parser syntax error: attribute "${attrName}" is missing a value`);
-
-          attrQuote = '';
-          attrValue = char;
-          mode = TEMPLATE_PARSER_MODES.ATTR_VALUE;
-          break;
-
-        case TEMPLATE_PARSER_MODES.ATTR_VALUE:
-          if (attrQuote) {
-            if (char === attrQuote) {
-              setStaticProp(attrName, attrValue);
-              attrName = '';
-              attrValue = '';
-              attrQuote = '';
-              mode = TEMPLATE_PARSER_MODES.IN_TAG;
-            } else {
-              attrValue += char;
-            }
-            break;
-          }
-
-          if (isWhitespace(char)) {
-            setStaticProp(attrName, attrValue);
-            attrName = '';
-            attrValue = '';
-            mode = TEMPLATE_PARSER_MODES.IN_TAG;
-            break;
-          }
-
-          if (char === '>') {
-            setStaticProp(attrName, attrValue);
-            attrName = '';
-            attrValue = '';
-            commitPendingTag();
-            mode = TEMPLATE_PARSER_MODES.TEXT;
-            break;
-          }
-
-          if (char === '/') {
-            setStaticProp(attrName, attrValue);
-            attrName = '';
-            attrValue = '';
-            mode = TEMPLATE_PARSER_MODES.SELF_CLOSE;
-            break;
-          }
-
-          if (char === '<')
-            throw new SyntaxError(`temtie/parser syntax error: invalid "<" inside attribute "${attrName}" value`);
-
-          attrValue += char;
-          break;
-
-        case TEMPLATE_PARSER_MODES.CLOSE_TAG:
-          if (!nameBuffer) {
-            if (isWhitespace(char))
-              throw new SyntaxError('temtie/parser syntax error: whitespace after "</" is not supported');
-
-            if (char === '>')
-              throw new SyntaxError('temtie/parser syntax error: stray closing tag');
-
-            if (!isNameStart(char))
-              throw new SyntaxError(`temtie/parser syntax error: invalid closing tag name start "${char}"`);
-
-            nameBuffer = char;
-            break;
-          }
-
-          if (closeTagWhitespaceOnly) {
-            if (isWhitespace(char))
+        case ATTR_VALUE: {
+          if (quote) {
+            const end = part.indexOf(quote, j);
+            if (end < 0) {
+              j = length;
               break;
+            }
 
-            if (char !== '>')
-              throw new SyntaxError(`temtie/parser syntax error: malformed closing tag </${nameBuffer}>`);
-
-            closeCurrentTag(nameBuffer);
-            nameBuffer = '';
-            closeTagWhitespaceOnly = false;
-            mode = TEMPLATE_PARSER_MODES.TEXT;
+            setStaticProp(attrName, part.slice(valueStart, end));
+            quote = '';
+            mode = IN_TAG;
+            j = end + 1;
             break;
           }
 
-          if (isWhitespace(char)) {
-            closeTagWhitespaceOnly = true;
-            break;
+          let c = part.charCodeAt(j);
+          while (j < length && c !== 62 && c !== 47 && !isSpace(c)) {
+            if (c === 60)
+              throw new SyntaxError(`${ERROR}invalid "<" inside attribute "${attrName}" value`);
+
+            c = part.charCodeAt(++j);
           }
 
-          if (char === '>') {
-            closeCurrentTag(nameBuffer);
-            nameBuffer = '';
-            mode = TEMPLATE_PARSER_MODES.TEXT;
-            break;
+          if (j === length) break;
+
+          setStaticProp(attrName, part.slice(valueStart, j));
+
+          if (c === 62) {
+            commitTag();
+            mode = TEXT;
+          } else {
+            mode = c === 47 ? SELF_CLOSE : IN_TAG;
           }
 
-          if (!isNameChar(char))
-            throw new SyntaxError(`temtie/parser syntax error: malformed closing tag </${nameBuffer}${char}>`);
-
-          nameBuffer += char;
+          j++;
           break;
+        }
 
-        case TEMPLATE_PARSER_MODES.SELF_CLOSE:
-          if (isWhitespace(char)) break;
+        case CLOSE_TAG: {
+          let c = part.charCodeAt(j);
 
-          if (char !== '>')
-            throw new SyntaxError('temtie/parser syntax error: malformed self-closing tag');
+          if (isSpace(c))
+            throw new SyntaxError(`${ERROR}whitespace after "</" is not supported`);
 
-          commitSelfClosingTag();
-          mode = TEMPLATE_PARSER_MODES.TEXT;
+          if (c === 62)
+            throw new SyntaxError(`${ERROR}stray closing tag`);
+
+          if (!isNameStart(c))
+            throw new SyntaxError(`${ERROR}invalid closing tag name start "${part[j]}"`);
+
+          nameStart = j;
+          do j++; while (j < length && isNameChar(c = part.charCodeAt(j)));
+          nameEnd = j;
+
+          if (j < length && isSpace(c))
+            do j++; while (j < length && isSpace(c = part.charCodeAt(j)));
+
+          if (j === length) break;
+
+          const tag = part.slice(nameStart, nameEnd);
+          if (c !== 62)
+            throw new SyntaxError(nameEnd < j
+              ? `${ERROR}malformed closing tag </${tag}>`
+              : `${ERROR}malformed closing tag </${tag}${part[j]}>`);
+
+          closeTag(tag);
+          mode = TEXT;
+          j++;
           break;
+        }
+
+        case SELF_CLOSE: {
+          const c = part.charCodeAt(j);
+
+          if (isSpace(c)) {
+            do j++; while (j < length && isSpace(part.charCodeAt(j)));
+            break;
+          }
+
+          if (c !== 62)
+            throw new SyntaxError(`${ERROR}malformed self-closing tag`);
+
+          placeTag(false);
+          mode = TEXT;
+          j++;
+          break;
+        }
       }
     }
 
-    if (i < strings.length - 1) handleInterpolation(i);
+    if (i === strings.length - 1) break;
+
+    // the interpolation after static `i`
+    switch (mode) {
+      case TEXT: {
+        // a child hole is a single marker: a permanent anchor that content
+        // lands after, referenced only while the hole has no content to speak for it
+        const marker = builder.createMarker();
+        builder.insert(ctx.node, marker);
+        holes.push({ type: TEMPLATE_HOLE_TYPES.CHILD, slot: i, path: [...ctx.path, ctx.childIndex] });
+        if (ctx.node === fragment) lastHoleMarker = marker;
+        ctx.childIndex++;
+        break;
+      }
+
+      case IN_TAG:
+        if (spreadDots === 3) {
+          holes.push({ type: TEMPLATE_HOLE_TYPES.SPREAD, slot: i, path: pendingPath });
+          spreadDots = 0;
+          break;
+        }
+
+        if (spreadDots !== 0)
+          throw new SyntaxError(`${ERROR}spread syntax requires exact \`...\` immediately before interpolation`);
+
+        throw new SyntaxError(`${ERROR}bare interpolation inside a tag is not supported`);
+
+      case ATTR_EQ:
+        assertCoreName(attrName, false);
+        claimName(attrNames, attrName, 'attribute');
+        holes.push({ type: TEMPLATE_HOLE_TYPES.ATTR, slot: i, path: pendingPath, prop: attrName });
+        mode = IN_TAG;
+        break;
+
+      case ATTR_NAME:
+        attrName = part.slice(attrStart);
+        assertCoreName(attrName, true);
+        claimName(metaNames, attrName, 'metadata');
+        holes.push({ type: TEMPLATE_HOLE_TYPES.META, slot: i, path: pendingPath, name: attrName });
+        mode = IN_TAG;
+        break;
+
+      case ATTR_VALUE:
+        if (!quote)
+          throw new SyntaxError(`${ERROR}partial interpolation inside unquoted attribute "${attrName}" is not supported`);
+
+        if (valueStart === part.length)
+          throw new SyntaxError(`${ERROR}quoted dynamic attribute ${attrName} is not supported; write ${attrName}=\${value} without quotes`);
+
+        throw new SyntaxError(`${ERROR}partial interpolation inside quoted attribute "${attrName}" is not supported`);
+
+      case TAG_OPEN:
+        throw new SyntaxError(`${ERROR}interpolation is not allowed immediately after \`<\``);
+
+      case TAG_NAME:
+        throw new SyntaxError(`${ERROR}interpolation is not allowed inside tag name "${part.slice(nameStart)}"`);
+
+      case CLOSE_TAG:
+        throw new SyntaxError(`${ERROR}interpolation is not allowed inside a closing tag`);
+
+      case SELF_CLOSE:
+        throw new SyntaxError(`${ERROR}interpolation is not allowed inside self-closing syntax`);
+    }
   }
 
-  if (mode === TEMPLATE_PARSER_MODES.TEXT)
-    flushText();
-  else if (mode === TEMPLATE_PARSER_MODES.ATTR_VALUE && attrQuote)
-    throw new SyntaxError(`temtie/parser syntax error: unterminated quoted attribute value for "${attrName}"`);
-  else if (mode === TEMPLATE_PARSER_MODES.ATTR_NAME)
-    throw new SyntaxError(`temtie/parser syntax error: unterminated opening tag while parsing attribute "${attrName}"`);
-  else if (mode === TEMPLATE_PARSER_MODES.ATTR_EQ)
-    throw new SyntaxError(`temtie/parser syntax error: attribute "${attrName}" is missing a value`);
-  else if (mode === TEMPLATE_PARSER_MODES.ATTR_VALUE)
-    throw new SyntaxError(`temtie/parser syntax error: unterminated opening tag after attribute "${attrName}"`);
-  else if (mode === TEMPLATE_PARSER_MODES.TAG_OPEN)
-    throw new SyntaxError('temtie/parser syntax error: unterminated "<" at end of template');
-  else if (mode === TEMPLATE_PARSER_MODES.TAG_NAME)
-    throw new SyntaxError(`temtie/parser syntax error: unterminated tag name "${nameBuffer}"`);
-  else if (mode === TEMPLATE_PARSER_MODES.IN_TAG)
-    if (spreadDots !== 0)
-      throw new SyntaxError('temtie/parser syntax error: spread syntax must be followed by interpolation');
-    else
-      throw new SyntaxError(`temtie/parser syntax error: unterminated opening tag <${pendingTagName}>`);
-  else if (mode === TEMPLATE_PARSER_MODES.CLOSE_TAG)
-    throw new SyntaxError(`temtie/parser syntax error: unterminated closing tag </${nameBuffer}>`);
-  else if (mode === TEMPLATE_PARSER_MODES.SELF_CLOSE)
-    throw new SyntaxError('temtie/parser syntax error: malformed self-closing tag');
+  switch (mode) {
+    case ATTR_VALUE:
+      throw new SyntaxError(quote
+        ? `${ERROR}unterminated quoted attribute value for "${attrName}"`
+        : `${ERROR}unterminated opening tag after attribute "${attrName}"`);
+
+    case ATTR_NAME:
+      throw new SyntaxError(`${ERROR}unterminated opening tag while parsing attribute "${part.slice(attrStart)}"`);
+
+    case ATTR_EQ:
+      throw new SyntaxError(`${ERROR}attribute "${attrName}" is missing a value`);
+
+    case TAG_OPEN:
+      throw new SyntaxError(`${ERROR}unterminated "<" at end of template`);
+
+    case TAG_NAME:
+      throw new SyntaxError(`${ERROR}unterminated tag name "${part.slice(nameStart)}"`);
+
+    case IN_TAG:
+      throw spreadDots !== 0
+        ? spreadWithoutHole()
+        : new SyntaxError(`${ERROR}unterminated opening tag <${pendingTag}>`);
+
+    case CLOSE_TAG:
+      throw new SyntaxError(`${ERROR}unterminated closing tag </${nameStart < 0 ? '' : part.slice(nameStart, nameEnd)}>`);
+
+    case SELF_CLOSE:
+      throw new SyntaxError(`${ERROR}malformed self-closing tag`);
+  }
 
   // hole content lands after its marker, so a template ending in a
   // top-level hole gets a pin: the fragment's last node must stay physical
@@ -598,10 +493,10 @@ function deriveKeySlot(holes) {
     // a reserved name is never silently dead: #key either keys the segment
     // or refuses to compile
     if (!Array.isArray(hole.path) || hole.path.length !== 1)
-      throw new SyntaxError('temtie/parser syntax error: #key belongs on a root element of the template');
+      throw new SyntaxError(`${ERROR}#key belongs on a root element of the template`);
 
     if (slot !== -1)
-      throw new SyntaxError('temtie/parser syntax error: a template takes a single #key');
+      throw new SyntaxError(`${ERROR}a template takes a single #key`);
 
     slot = hole.slot;
   }
