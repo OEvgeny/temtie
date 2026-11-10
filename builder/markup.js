@@ -9,8 +9,19 @@ import { compileTemplate } from '../parser.js';
 // builder is named for the medium it writes, not the syntax it accepts:
 // swap compile() and something other than html parses into the same tree.
 
+// a node the builder made carries this; a value is adopted as a node only if
+// it does. a plain object is data, not a node — it is String()'d, never moved
+// into the medium, and never mutated (Q44/Q45).
+const NODE = Symbol('markup.node');
+
+function markTree(node) {
+  if (!node || typeof node !== 'object') return;
+  node[NODE] = true;
+  for (const child of node.children ?? []) markTree(child);
+}
+
 function el(type) {
-  return { type, children: [], props: {}, parent: null };
+  return { type, children: [], props: {}, parent: null, [NODE]: true };
 }
 
 function detach(node) {
@@ -63,15 +74,17 @@ export class MarkupBuilder {
   }
 
   createText(text) {
-    return { text, parent: null };
+    return { text, parent: null, [NODE]: true };
   }
 
   createMarker() {
-    return { marker: true, parent: null };
+    return { marker: true, parent: null, [NODE]: true };
   }
 
   clone(node) {
-    return structuredClone(node);
+    const copy = structuredClone(node);
+    markTree(copy);
+    return copy;
   }
 
   resolve(root, path) {
@@ -158,7 +171,7 @@ export class MarkupBuilder {
     if (value == null || value === false) return [];
     if (Array.isArray(value)) return value.flatMap(this.toNodes, this);
     if (isIterable(value)) return Array.from(value).flatMap(this.toNodes, this);
-    if (typeof value === 'object') return [value];
+    if (value && value[NODE]) return [value];
     return [this.createText(String(value))];
   }
 
