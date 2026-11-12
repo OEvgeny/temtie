@@ -8,7 +8,7 @@ export interface Builder<Node = unknown, NodeCollection = unknown[], Root = Node
   createRoot(): Root;
   decodeStatic?(value: string, context?: 'text' | 'attr'): string;
   isVoidElement?(tag: string): boolean;
-  createElement(tag: string): Node;
+  createElement(tag: string, parent?: Node): Node;
   createText(text: string): Node;
   createMarker(): Node;
   setProp(node: Node, name: PropertyKeyLike, value: unknown): void;

@@ -50,8 +50,12 @@ export class DOMBuilder {
     return textarea.value;
   }
 
-  createElement(tag) {
-    return this.document.createElement(tag);
+  // <svg> opens the SVG namespace and its descendants inherit it; the children
+  // of a <foreignObject> are HTML again
+  createElement(tag, parent) {
+    return tag === 'svg' || (parent?.namespaceURI === SVG_NAMESPACE && parent.localName !== 'foreignObject')
+      ? this.document.createElementNS(SVG_NAMESPACE, tag)
+      : this.document.createElement(tag);
   }
 
   createText(text) {

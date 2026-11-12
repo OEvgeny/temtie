@@ -77,7 +77,7 @@ function parseTemplate(strings, builder) {
   }
 
   function openTag(tag) {
-    pending = builder.createElement(tag);
+    pending = builder.createElement(tag, ctx.node);
     pendingPath = [...ctx.path, ctx.childIndex];
     pendingTag = tag;
     attrNames = [];
