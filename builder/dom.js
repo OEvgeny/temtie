@@ -17,12 +17,10 @@ function isIterable(value) {
   return value != null && typeof value !== 'string' && typeof value[Symbol.iterator] === 'function';
 }
 
-function shouldSetProperty(node, name) {
-  return (
-    typeof name === 'symbol' ||
-    (typeof name === 'string' && name.startsWith('on')) ||
-    node?.[TEMTIE_PROP_NAMES]?.has(name)
-  );
+const isHandler = (name, value) => typeof name === 'string' && name.startsWith('on') && typeof value === 'function';
+
+function shouldSetProperty(node, name, value) {
+  return typeof name === 'symbol' || isHandler(name, value) || node?.[TEMTIE_PROP_NAMES]?.has(name);
 }
 
 /** @implements {Builder<Node, Node[], DocumentFragment>} */
@@ -67,11 +65,13 @@ export class DOMBuilder {
   }
 
   setProp(node, name, value) {
-    if (shouldSetProperty(node, name)) {
+    if (shouldSetProperty(node, name, value)) {
       node[name] = value ?? null;
       return;
     }
 
+    // a handler the name held gives way to the attribute
+    if (isHandler(name, node[name])) node[name] = null;
     if (value === true)
       node.setAttribute(name, '');
     else if (value === false || value == null)
@@ -81,12 +81,8 @@ export class DOMBuilder {
   }
 
   unsetProp(node, name) {
-    if (shouldSetProperty(node, name)) {
-      node[name] = null;
-      return;
-    }
-
-    node.removeAttribute(name);
+    if (shouldSetProperty(node, name, node[name])) node[name] = null;
+    if (typeof name === 'string') node.removeAttribute(name);
   }
 
   clone(root) {

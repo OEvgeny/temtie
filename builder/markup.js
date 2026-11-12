@@ -228,8 +228,7 @@ const INVALID_NAME = /[\s"'>/=]/;
 function serializeProps(props) {
   let out = '';
   for (const name of Object.keys(props)) {
-    // on* mirror the dom builder's property route: never an attribute
-    if (name.startsWith('on') || INVALID_NAME.test(name)) continue;
+    if (INVALID_NAME.test(name)) continue;
     const value = props[name];
     if (value === false || value == null) continue;
     if (typeof value === 'function' || typeof value === 'symbol') continue;
