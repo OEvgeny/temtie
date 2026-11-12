@@ -585,8 +585,8 @@ function flushTarget(target) {
   const boundary = target.cursor;
   for (let segment = boundary.next; segment; segment = segment.next) {
     debug.enabled && debug.emit({ type: 'drop', target, segment });
-    if (segment.builder.parent(segment.start)) segment.builder.extract(segment.start, segment.end);
     sweepSegment(segment, disposeTarget);
+    if (segment.builder.parent(segment.start)) segment.builder.extract(segment.start, segment.end);
   }
   boundary.next = null;
 
