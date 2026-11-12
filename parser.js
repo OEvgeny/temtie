@@ -410,13 +410,17 @@ function parseTemplate(strings, builder) {
         mode = IN_TAG;
         break;
 
-      case ATTR_NAME:
+      case ATTR_NAME: {
         attrName = part.slice(attrStart);
+        const next = strings[i + 1];
+        if (attrName[0] !== '#' || (next.length && !isSpace(next.charCodeAt(0)) && next[0] !== '>' && next[0] !== '/'))
+          throw new SyntaxError(`${ERROR}interpolation is not allowed inside attribute name "${attrName}"`);
         assertCoreName(attrName, true);
         claimName(metaNames, attrName, 'metadata');
         holes.push({ type: TEMPLATE_HOLE_TYPES.META, slot: i, path: pendingPath, name: attrName });
         mode = IN_TAG;
         break;
+      }
 
       case ATTR_VALUE:
         if (!quote)
