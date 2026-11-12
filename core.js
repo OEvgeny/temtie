@@ -119,6 +119,7 @@ function makeTarget(proto, anchor) {
     pass: 0,
     state: IDLE,
     moved: false, // orthogonal: an idle target can still need placement
+    reordered: false, // the chain was relinked since the last commit
     buckets: new Map(),
   };
 }
@@ -219,7 +220,7 @@ function makeSegment(site) {
   }
 
   const bindings = template.holes.map((hole) => makeBinding(builder, fragment, hole));
-  return { template, builder, start, end, bindings, values: [], prev: null, next: null, pass: 0, parked: null, sunk: false };
+  return { template, builder, start, end, bindings, values: [], prev: null, next: null, pass: 0, parked: null, sunk: false, clean: false };
 }
 
 // a child marker never moves and never leaves: content lives after it
@@ -257,6 +258,7 @@ function emit(target, segment) {
     ahead.prev = segment;
     target.cursor.next = segment;
     ahead.sunk = true;
+    target.reordered = true;
   }
   if (target.cursor.next === segment) {
     target.cursor = segment;
@@ -272,6 +274,7 @@ function emit(target, segment) {
   if (tail) tail.prev = segment;
   target.cursor.next = segment;
   target.cursor = segment;
+  target.reordered = true;
 }
 
 // a destination answers for its hole kind: where a hosted body lives
@@ -344,20 +347,38 @@ function lay(anchor, builder) {
   return marker;
 }
 
+// a segment is clean when the flush would write none of its holes
 function resolveSegment(target, segment, values) {
   segment.values = values;
+  let clean = true;
   for (const binding of segment.bindings) {
     const raw = values[binding.slot];
-    // a primitive carries no contract and no target
-    if (raw === null || (typeof raw !== 'object' && typeof raw !== 'function')) {
-      resolvePlain(binding);
-      continue;
+    if (raw !== null && (typeof raw === 'object' || typeof raw === 'function')) {
+      const init = raw[VALUE];
+      if (init !== undefined) {
+        clean = false;
+        resolveInstance(target, binding, raw, init);
+        continue;
+      }
+      if (raw[PRIVATE]) {
+        clean = false;
+        resolveBody(target, binding, raw[PRIVATE]);
+        continue;
+      }
     }
-    const init = raw[VALUE];
-    if (init !== undefined) resolveInstance(target, binding, raw, init);
-    else if (raw[PRIVATE]) resolveBody(target, binding, raw[PRIVATE]);
-    else resolvePlain(binding);
+    if (!holds(binding, raw)) {
+      clean = false;
+      resolvePlain(binding);
+    }
   }
+  segment.clean = clean;
+}
+
+// whether the hole already holds the value, or never writes one (a key)
+function holds(binding, raw) {
+  const occupant = binding.occupant;
+  if (!occupant) return !binding.dest.write;
+  return !binding.dest.eager && occupant.kind === 'plain' && same(occupant.prev, raw);
 }
 
 function resolvePlain(binding) {
@@ -581,13 +602,15 @@ function placeTarget(target) {
 
 function flushTarget(target) {
   if (!target.anchor) throw new Error('temtie/core: cannot commit an unanchored capture');
+  const boundary = target.cursor,
+    reshaped = target.moved || target.reordered || boundary.next !== null;
   target.state = IDLE;
   target.moved = false;
+  target.reordered = false;
   flushEnds(target.anchor);
 
   // what leaves and what sank step out first: left in the medium, either
   // would make every segment after it look out of place
-  const boundary = target.cursor;
   for (let segment = boundary.next; segment; segment = segment.next) {
     debug.enabled && debug.emit({ type: 'drop', target, segment });
     sweepSegment(segment, disposeTarget);
@@ -596,21 +619,29 @@ function flushTarget(target) {
   boundary.next = null;
 
   let prevEnd = null;
-  for (let segment = target.head.next; segment; segment = segment.next) {
-    if (segment.sunk) {
-      segment.sunk = false;
-      if (!inPlace(target, segment, prevEnd)) park(segment);
+  if (reshaped)
+    for (let segment = target.head.next; segment; segment = segment.next) {
+      if (segment.sunk) {
+        segment.sunk = false;
+        if (!inPlace(target, segment, prevEnd)) park(segment);
+      }
+      prevEnd = segment.end;
+    }
+
+  // in an unchanged chain a clean segment is skipped, until a placement moves
+  // and every later one is asked again. The first is always asked: its anchor
+  // re-lays a marker the container may have lost
+  const first = target.head.next;
+  let still = !reshaped;
+  prevEnd = null;
+  for (let segment = first; segment; segment = segment.next) {
+    if (!still || segment === first || !segment.clean) {
+      if (place(target, segment, prevEnd)) still = false;
+      for (const binding of segment.bindings) flushBinding(binding, segment.values);
     }
     prevEnd = segment.end;
   }
-
-  prevEnd = null;
-  for (let segment = target.head.next; segment; segment = segment.next) {
-    place(target, segment, prevEnd);
-    for (const binding of segment.bindings) flushBinding(binding, segment.values);
-    prevEnd = segment.end;
-  }
-  pruneBuckets(target);
+  if (reshaped) pruneBuckets(target);
   deliver(target);
 }
 
@@ -631,8 +662,9 @@ function inPlace(target, segment, prevEnd) {
     : builder.parent(segment.start) === anchor.dest.container(anchor);
 }
 
+// answers whether the segment moved
 function place(target, segment, prevEnd) {
-  if (!segment.parked && inPlace(target, segment, prevEnd)) return;
+  if (!segment.parked && inPlace(target, segment, prevEnd)) return false;
 
   const builder = segment.builder,
     anchor = target.anchor,
@@ -645,6 +677,7 @@ function place(target, segment, prevEnd) {
   segment.parked = null;
   debug.enabled && debug.emit({ type: 'move', target, segment, container, after });
   builder.insert(container, content, after);
+  return true;
 }
 
 // SameValueZero: a hole holding NaN is settled when it is handed NaN again
