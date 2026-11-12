@@ -642,6 +642,9 @@ function place(target, segment, prevEnd) {
   builder.insert(container, content, after);
 }
 
+// SameValueZero: a hole holding NaN is settled when it is handed NaN again
+const same = (a, b) => a === b || (a !== a && b !== b);
+
 function flushBinding(binding, values) {
   flushEnds(binding);
   const occupant = binding.occupant;
@@ -649,7 +652,7 @@ function flushBinding(binding, values) {
   if (occupant.kind === 'instance') occupant.hooks.commit?.(handleOf(binding));
   else if (occupant.kind === 'plain') {
     const value = values[binding.slot];
-    if (binding.dest.eager || value !== occupant.prev) {
+    if (binding.dest.eager || !same(value, occupant.prev)) {
       binding.dest.write(binding, value);
       occupant.prev = value;
     }
