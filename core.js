@@ -201,6 +201,8 @@ function takeSegment(target, site, values) {
     if (keyed) bucket.byKey.set(key, segment);
     else bucket.byIndex[bucket.used] = segment;
   }
+  debug.enabled && debug.assert(!keyed || segment.pass !== target.pass,
+    'temtie/core: duplicate key in one pass', { assert: 'duplicate-key', target, key, segment });
   return segment;
 }
 
@@ -635,8 +637,11 @@ function place(target, segment, prevEnd) {
   const builder = segment.builder,
     anchor = target.anchor,
     after = prevEnd ?? anchor.dest.after?.(anchor, builder),
-    container = anchor.dest.container(anchor),
-    content = segment.parked ?? builder.extract(segment.start, segment.end);
+    container = anchor.dest.container(anchor);
+  debug.enabled && debug.assert(segment.parked || builder.parent(segment.start),
+    'temtie/core: cannot place a segment whose nodes left the medium',
+    { assert: 'detached-start', target, segment, destination: container });
+  const content = segment.parked ?? builder.extract(segment.start, segment.end);
   segment.parked = null;
   debug.enabled && debug.emit({ type: 'move', target, segment, container, after });
   builder.insert(container, content, after);
