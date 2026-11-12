@@ -42,13 +42,13 @@ const debug = {
     this.enabled = false;
   },
 
+  // a failed assert is recorded, not thrown: the caller carries on and a
+  // listener learns the runtime broke an invariant
   assert(condition, message, ev = {}) {
     if (condition) return;
-    const error = new Error(message);
     ev.type ??= 'assert-failed';
-    ev.error = error;
+    ev.error = new Error(message);
     this.emit(ev);
-    throw error;
   },
 
   // the hub owns logical time: seq is the total order, cause the enclosing
@@ -68,8 +68,8 @@ const debug = {
   // performance.measure entries, named by the caller — e.g.
   // debug.meter({ 'temtie:commit': ['commit', 'settled'] })
   meter(spans, perf = globalThis.performance) {
-    this.assert(typeof perf?.now === 'function' && typeof perf?.measure === 'function',
-      'debug.meter(): requires a perf with now() and measure()', { assert: 'debug.meter' });
+    if (typeof perf?.now !== 'function' || typeof perf?.measure !== 'function')
+      throw new TypeError('debug.meter(): requires a perf with now() and measure()');
     const starts = new Set(), ends = new Map();
     for (const [name, [start, end]] of Object.entries(spans)) {
       starts.add(start);
