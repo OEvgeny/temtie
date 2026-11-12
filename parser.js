@@ -72,7 +72,7 @@ function parseTemplate(strings, builder) {
     lastHoleMarker = null;
 
   function insertText(text) {
-    builder.insert(ctx.node, builder.createText(decodeStatic(text, 'text')));
+    builder.insert(ctx.node, builder.createText(decodeStatic(text, 'text'), text));
     ctx.childIndex++;
   }
 
@@ -105,7 +105,8 @@ function parseTemplate(strings, builder) {
   function setStaticProp(name, value) {
     assertCoreName(name, false);
     claimName(attrNames, name, 'attribute');
-    builder.setProp(pending, name, value === true ? value : decodeStatic(value, 'attr'));
+    if (value === true) builder.setProp(pending, name, true);
+    else builder.setProp(pending, name, decodeStatic(value, 'attr'), value);
   }
 
   function closeTag(tag) {

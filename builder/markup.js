@@ -34,14 +34,28 @@ function isIterable(value) {
   return value != null && typeof value !== 'string' && typeof value[Symbol.iterator] === 'function';
 }
 
-const NAMED_ENTITIES = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: '\u00a0' };
+const NAMED_ENTITIES = new Map(Object.entries({
+  amp: '&', lt: '<', gt: '>', quot: '"', apos: "'",
+  nbsp: '\u00a0', ensp: '\u2002', emsp: '\u2003', thinsp: '\u2009', shy: '\u00ad', zwj: '\u200d', zwnj: '\u200c',
+  copy: '©', reg: '®', trade: '™', hellip: '…', mdash: '—', ndash: '–', minus: '−',
+  lsquo: '‘', rsquo: '’', ldquo: '“', rdquo: '”', laquo: '«', raquo: '»',
+  bull: '•', middot: '·', times: '×', divide: '÷', deg: '°', plusmn: '±',
+  euro: '€', pound: '£', yen: '¥', cent: '¢', sect: '§', para: '¶',
+  larr: '←', rarr: '→', uarr: '↑', darr: '↓', harr: '↔', hearts: '♥',
+}));
 
-// statics arrive spelled as markup: entities decode into the tree once, and
-// serialize re-encodes — the same round trip a DOM tree makes for free
+const ENTITY = /&(#[xX]?[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);/g;
+
+// statics decode into the tree for common names and numeric references. A
+// static naming an entity this table lacks keeps its source, which serialize
+// writes as written, so the browser decodes the name itself
+const namesUnknown = (source) =>
+  source.includes('&') && source.match(ENTITY)?.some((entity) => entity[1] !== '#' && !NAMED_ENTITIES.has(entity.slice(1, -1)));
+
 function decodeEntities(text) {
   if (!text.includes('&')) return text;
-  return text.replace(/&(#[xX]?[0-9a-fA-F]+|[a-zA-Z]+);/g, (entity, body) => {
-    if (body[0] !== '#') return NAMED_ENTITIES[body.toLowerCase()] ?? entity;
+  return text.replace(ENTITY, (entity, body) => {
+    if (body[0] !== '#') return NAMED_ENTITIES.get(body) ?? entity;
     const code = body[1] === 'x' || body[1] === 'X'
       ? Number.parseInt(body.slice(2), 16)
       : Number.parseInt(body.slice(1), 10);
@@ -73,8 +87,10 @@ export class MarkupBuilder {
     return el(tag);
   }
 
-  createText(text) {
-    return { text, parent: null, [NODE]: true };
+  createText(text, source) {
+    const node = { text, parent: null, [NODE]: true };
+    if (source !== undefined && namesUnknown(source)) node.source = source;
+    return node;
   }
 
   createMarker() {
@@ -202,12 +218,15 @@ export class MarkupBuilder {
   // props store raw values; what an attribute means is decided at serialize.
   // storing false and deleting the key both serialize to absence — the same
   // pair the dom builder spells as removeAttribute
-  setProp(node, name, value) {
+  setProp(node, name, value, source) {
     node.props[name] = value;
+    if (source !== undefined && namesUnknown(source)) (node.sources ??= {})[name] = source;
+    else if (node.sources) delete node.sources[name];
   }
 
   unsetProp(node, name) {
     delete node.props[name];
+    if (node.sources) delete node.sources[name];
   }
 
   serialize(node) {
@@ -225,14 +244,17 @@ const escapeAttr = (text) =>
 
 const INVALID_NAME = /[\s"'>/=]/;
 
-function serializeProps(props) {
+function serializeProps(props, sources) {
   let out = '';
   for (const name of Object.keys(props)) {
     if (INVALID_NAME.test(name)) continue;
     const value = props[name];
     if (value === false || value == null) continue;
     if (typeof value === 'function' || typeof value === 'symbol') continue;
-    out += value === true ? ` ${name}` : ` ${name}="${escapeAttr(String(value))}"`;
+    const source = sources?.[name];
+    out += value === true ? ` ${name}`
+      : source !== undefined ? ` ${name}="${source.replace(/"/g, '&quot;')}"`
+      : ` ${name}="${escapeAttr(String(value))}"`;
   }
   return out;
 }
@@ -244,14 +266,14 @@ function serializeProps(props) {
 // escaping, not honored
 function serializeNode(node, voidElements) {
   if (node == null || node.marker) return '';
-  if ('text' in node) return escapeText(String(node.text));
+  if ('text' in node) return node.source ?? escapeText(String(node.text));
 
   const children = (node.children ?? [])
     .map((child) => serializeNode(child, voidElements))
     .join('');
   if (node.fragment || !node.type || node.type[0] === '#') return children;
 
-  const open = `<${node.type}${serializeProps(node.props ?? {})}>`;
+  const open = `<${node.type}${serializeProps(node.props ?? {}, node.sources)}>`;
   if (voidElements.has(node.type.toLowerCase())) return open;
   return `${open}${children}</${node.type}>`;
 }
