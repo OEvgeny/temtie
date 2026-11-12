@@ -387,6 +387,8 @@ function resolveBody(parent, binding, ref) {
   if (occupant?.kind !== 'body' || occupant.body !== child) {
     displace(binding);
     binding.occupant = { kind: 'body', body: child };
+    // a body this hole gave up earlier in the pass is taken back, not ended
+    if (binding.leavers) binding.leavers = binding.leavers.filter((occ) => occ.body !== child);
     debug.enabled && debug.emit({ type: 'claim', binding, occupant: binding.occupant });
   }
   hook(parent, child, binding);
