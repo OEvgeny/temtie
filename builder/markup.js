@@ -142,10 +142,10 @@ export class MarkupBuilder {
   }
 
   extract(start, end) {
-    const parent = start.parent,
-      from = parent.children.indexOf(start),
-      to = parent.children.indexOf(end),
-      nodes = parent.children.splice(from, to - from + 1);
+    if (!start.parent) throw new Error('temtie/builder/markup: extract: start is detached');
+    const nodes = this.collectRange(start, end),
+      siblings = start.parent.children;
+    siblings.splice(siblings.indexOf(start), nodes.length);
     for (const node of nodes) node.parent = null;
     return start === end ? nodes[0] : nodes;
   }
