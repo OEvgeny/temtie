@@ -460,7 +460,8 @@ function endBody(body, sink) {
   // re-anchored: evict only while the move is pending — its DOM
   // legitimately lives elsewhere otherwise
   if (body.anchor) {
-    if (body.moved) evictChain(body.head.next);
+    const first = body.head.next;
+    if (body.moved && first && !inPlace(body, first, null)) evictChain(first);
     return;
   }
   evictChain(body.head.next);
@@ -590,13 +591,16 @@ function flushTarget(target) {
   }
   boundary.next = null;
 
-  for (let segment = target.head.next; segment; segment = segment.next)
+  let prevEnd = null;
+  for (let segment = target.head.next; segment; segment = segment.next) {
     if (segment.sunk) {
       segment.sunk = false;
-      park(segment);
+      if (!inPlace(target, segment, prevEnd)) park(segment);
     }
+    prevEnd = segment.end;
+  }
 
-  let prevEnd = null;
+  prevEnd = null;
   for (let segment = target.head.next; segment; segment = segment.next) {
     place(target, segment, prevEnd);
     for (const binding of segment.bindings) flushBinding(binding, segment.values);
@@ -613,18 +617,23 @@ function deliver(target) {
   anchor.dest.deliver(anchor);
 }
 
-// a segment right behind its anchor shares the anchor's container, so one
-// read settles the common case; only an anchorless start asks for the parent
-function place(target, segment, prevEnd) {
+// whether the medium already has the segment where the target would place it
+function inPlace(target, segment, prevEnd) {
   const builder = segment.builder,
     anchor = target.anchor,
     after = prevEnd ?? anchor.dest.after?.(anchor, builder);
-
-  if (!segment.parked && (after
+  return after
     ? builder.prev(segment.start) === after
-    : builder.parent(segment.start) === anchor.dest.container(anchor))) return;
+    : builder.parent(segment.start) === anchor.dest.container(anchor);
+}
 
-  const container = anchor.dest.container(anchor),
+function place(target, segment, prevEnd) {
+  if (!segment.parked && inPlace(target, segment, prevEnd)) return;
+
+  const builder = segment.builder,
+    anchor = target.anchor,
+    after = prevEnd ?? anchor.dest.after?.(anchor, builder),
+    container = anchor.dest.container(anchor),
     content = segment.parked ?? builder.extract(segment.start, segment.end);
   segment.parked = null;
   debug.enabled && debug.emit({ type: 'move', target, segment, container, after });
