@@ -65,8 +65,19 @@ export function skip(inst) {
   if (!ref) throw new TypeError('temtie/core: skip() expects a target from mount() or capture()');
   const target = ref.target;
   if (target?.state !== STAGED) return;
+  voidOpened(target);
   call(target, 'skip');
   target.state = SEALED;
+}
+
+// a voided pass closes the passes it opened: a descendant whose pass began
+// after this one keeps its draft, but a render starts it over instead of
+// appending. One staged before it keeps its own
+function voidOpened(target, since = target.pass) {
+  for (const child of target.children) {
+    voidOpened(child, since);
+    if (child.state === STAGED && child.pass > since) child.closed = true;
+  }
 }
 
 // reset() stages emptiness, not destruction: the committed segments stay
@@ -77,6 +88,7 @@ export function reset(inst) {
   if (!ref) throw new TypeError('temtie/core: reset() expects a target from mount() or capture()');
   const target = ref.target;
   if (!target) return;
+  if (target.state === STAGED) voidOpened(target);
   call(target, 'reset');
 }
 
@@ -86,6 +98,7 @@ function call(target, via = 'render') {
   target.state = STAGED;
   target.pass = ++PASS;
   target.cursor = target.head;
+  target.closed = false;
   debug.enabled && debug.emit({ type: 'call', target, pass: target.pass, via });
 }
 
@@ -120,6 +133,7 @@ function makeTarget(proto, anchor) {
     state: IDLE,
     moved: false, // orthogonal: an idle target can still need placement
     reordered: false, // the chain was relinked since the last commit
+    closed: false, // a voided ancestor ended the pass this one was staged in
     buckets: new Map(),
   };
 }
@@ -171,7 +185,7 @@ function makeChannel(builder) {
 }
 
 function touch(target) {
-  if (target.state === STAGED) return;
+  if (target.state === STAGED && !target.closed) return;
   if (target.state === SEALED) {
     target.state = STAGED;
     return;
