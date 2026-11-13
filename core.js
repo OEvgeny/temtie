@@ -414,6 +414,9 @@ function resolveBody(parent, binding, ref) {
   const occupant = binding.occupant,
     child = ref.target
       ?? (occupant?.kind === 'body' ? occupant.body : null)
+      // a body the hole gave up in a pass that never flushed is still the
+      // medium's: a fresh capture takes it back like the one the hole holds
+      ?? binding.leavers?.findLast((occ) => occ.kind === 'body' && !occ.body.anchor)?.body
       ?? makeTarget(parent.proto, null);
   if (child.anchor?.dest.kind === ROOT)
     throw new Error('temtie/core: a mounted root cannot be interpolated into a template');
@@ -446,13 +449,20 @@ function resolveInstance(parent, binding, raw, init) {
   const props = raw.props ?? [];
   let occupant = binding.occupant;
   if (occupant?.kind !== 'instance' || occupant.init !== init) {
+    // a claim the hole gave up in a pass that never flushed is taken back,
+    // its init and state with it: the hole ends nothing that never flushed
+    const back = binding.leavers?.findLast((occ) => occ.kind === 'instance' && occ.init === init);
     displace(binding);
-    const ref = makeRef(makeTarget(parent.proto, null));
-    occupant = binding.occupant = { kind: 'instance', init, ref, body: ref.target, hooks: null, after: binding.marker };
+    const ref = back?.ref ?? makeRef(makeTarget(parent.proto, null));
+    occupant = binding.occupant = back
+      ?? { kind: 'instance', init, ref, body: ref.target, hooks: null, after: binding.marker };
+    if (back) binding.leavers = binding.leavers.filter((occ) => occ !== back);
     debug.enabled && debug.emit({ type: 'claim', binding, occupant });
     hook(parent, occupant.body, binding);
-    const made = init(ref.inst, ...props);
-    occupant.hooks = typeof made === 'function' ? { render: made } : made ?? {};
+    if (!back) {
+      const made = init(ref.inst, ...props);
+      occupant.hooks = typeof made === 'function' ? { render: made } : made ?? {};
+    }
   } else {
     hook(parent, occupant.body, binding); // the body follows its binding every pass
   }
