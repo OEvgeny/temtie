@@ -133,6 +133,7 @@ function makeTarget(proto, anchor) {
     state: IDLE,
     moved: false, // orthogonal: an idle target can still need placement
     reordered: false, // the chain was relinked since the last commit
+    home: null, // the hole its content was last placed in
     closed: false, // a voided ancestor ended the pass this one was staged in
     buckets: new Map(),
   };
@@ -252,6 +253,7 @@ function makeBinding(builder, fragment, hole) {
     container: null,
     occupant: null,
     leavers: null,
+    resident: null, // the body whose content was last placed in this hole
     handle: null,
     bag: dest.kind === HOLE.SPREAD ? {} : null,
   };
@@ -474,11 +476,19 @@ function hook(parent, child, binding) {
   for (let cursor = parent; cursor; cursor = cursor.parent)
     if (cursor === child)
       throw new Error('temtie/core: a target cannot be anchored beneath its descendant');
+  if (child.anchor) leave(child.anchor, child);
   child.parent?.children.delete(child);
   child.parent = parent;
   child.anchor = binding;
   child.moved = true;
   parent.children.add(child);
+}
+
+// a body moved to another hole leaves its old hole empty: the old hole
+// forgets it and will not end it
+function leave(binding, body) {
+  if (binding.occupant?.body === body) binding.occupant = null;
+  if (binding.leavers) binding.leavers = binding.leavers.filter((occupant) => occupant.body !== body);
 }
 
 // displacing is bookkeeping: the DOM stays put until the ends fire at
@@ -506,15 +516,29 @@ function end(binding, occupant, sink) {
 }
 
 function endBody(body, sink) {
-  // re-anchored: evict only while the move is pending — its DOM
-  // legitimately lives elsewhere otherwise
-  if (body.anchor) {
-    const first = body.head.next;
-    if (body.moved && first && !inPlace(body, first, null)) evictChain(first);
-    return;
-  }
+  if (body.anchor) return; // moved on: the hole it left lifts its content out
   evictChain(body.head.next);
+  if (body.home?.resident === body) body.home.resident = null;
+  body.home = null;
   sink(body);
+}
+
+// a hole lifts out the content of a body that has moved on before the hole is
+// rewritten or removed, so the content does not leave with it
+function releaseResident(binding) {
+  const body = binding.resident;
+  if (!body || body.anchor === binding) return;
+  binding.resident = null;
+  if (body.home === binding) body.home = null;
+  evictChain(body.head.next);
+}
+
+function noteHome(target) {
+  const binding = target.anchor;
+  if (!binding || binding.dest.kind === ROOT) return;
+  if (target.home && target.home !== binding && target.home.resident === target) target.home.resident = null;
+  target.home = binding;
+  binding.resident = target;
 }
 
 function evictChain(segment) {
@@ -537,6 +561,7 @@ function flushEnds(binding, sink = disposeTarget) {
 // a disposed segment's standing occupant is displaced like any other leaver
 function sweepSegment(segment, sink) {
   for (const binding of segment.bindings) {
+    releaseResident(binding);
     displace(binding);
     flushEnds(binding, sink);
   }
@@ -622,6 +647,7 @@ function placeTarget(target) {
     prevEnd = segment.end;
   }
   if (target.head.next) deliver(target); // an empty body delivers nothing
+  noteHome(target);
 }
 
 function flushTarget(target) {
@@ -667,6 +693,7 @@ function flushTarget(target) {
   }
   if (reshaped) pruneBuckets(target);
   deliver(target);
+  noteHome(target);
 }
 
 function deliver(target) {
@@ -708,6 +735,7 @@ function place(target, segment, prevEnd) {
 const same = (a, b) => a === b || (a !== a && b !== b);
 
 function flushBinding(binding, values) {
+  releaseResident(binding);
   flushEnds(binding);
   const occupant = binding.occupant;
   if (!occupant) return;
