@@ -143,7 +143,8 @@ export class MarkupBuilder {
 
   insert(parent, content, after = null) {
     const nodes = [];
-    for (const node of Array.isArray(content) ? content : [content]) {
+    // a fragment gives up its children, as a DOM DocumentFragment does
+    for (const node of content?.type === '#fragment' ? [...content.children] : Array.isArray(content) ? content : [content]) {
       if (node === after) continue;
       const i = nodes.indexOf(node);
       if (i >= 0) nodes.splice(i, 1);
@@ -162,8 +163,12 @@ export class MarkupBuilder {
     const nodes = this.collectRange(start, end),
       siblings = start.parent.children;
     siblings.splice(siblings.indexOf(start), nodes.length);
-    for (const node of nodes) node.parent = null;
-    return start === end ? nodes[0] : nodes;
+    // like a DOM fragment, the lifted run keeps a parent: a range nested in it
+    // can still be lifted out on its own later
+    const fragment = el('#fragment');
+    fragment.children = nodes;
+    for (const node of nodes) node.parent = fragment;
+    return fragment;
   }
 
   remove(start, end) {
