@@ -546,6 +546,8 @@ function evictChain(segment) {
 }
 
 function park(segment) {
+  // content that moved out of this range steps out before the range leaves
+  for (const binding of segment.bindings) releaseResident(binding);
   if (segment.builder.parent(segment.start))
     segment.parked = segment.builder.extract(segment.start, segment.end);
 }
