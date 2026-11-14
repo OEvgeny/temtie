@@ -484,11 +484,13 @@ function hook(parent, child, binding) {
   parent.children.add(child);
 }
 
-// a body moved to another hole leaves its old hole empty: the old hole
-// forgets it and will not end it
+// the old hole forgets a body occupant. an instance still ends at flush —
+// release and clear — and endBody does not dispose the body that moved on
 function leave(binding, body) {
-  if (binding.occupant?.body === body) binding.occupant = null;
-  if (binding.leavers) binding.leavers = binding.leavers.filter((occupant) => occupant.body !== body);
+  if (binding.occupant?.body === body && binding.occupant.kind === 'instance') displace(binding);
+  else if (binding.occupant?.body === body) binding.occupant = null;
+  if (binding.leavers)
+    binding.leavers = binding.leavers.filter((occupant) => occupant.kind === 'instance' || occupant.body !== body);
 }
 
 // displacing is bookkeeping: the DOM stays put until the ends fire at
