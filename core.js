@@ -644,6 +644,7 @@ function withCause(ev, run) {
 // an idle body whose anchor moved is placed, not re-rendered
 function placeTarget(target) {
   target.moved = false;
+  releaseResident(target.anchor);
   flushEnds(target.anchor);
   let prevEnd = null;
   for (let segment = target.head.next; segment; segment = segment.next) {
@@ -661,6 +662,7 @@ function flushTarget(target) {
   target.state = IDLE;
   target.moved = false;
   target.reordered = false;
+  releaseResident(target.anchor);
   flushEnds(target.anchor);
 
   // what leaves and what sank step out first: left in the medium, either
