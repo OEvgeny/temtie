@@ -334,7 +334,7 @@ const DEST = {
     // handover, never reconciliation: the receiver decides what a
     // re-assignment means
     deliver(binding) {
-      binding.builder.setProp(binding.node, binding.prop, binding.container);
+      binding.builder.setProp(binding.node, binding.prop, binding.container ??= binding.builder.createRoot());
     }
   },
   [HOLE.META]: {
