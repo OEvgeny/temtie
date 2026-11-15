@@ -114,7 +114,7 @@ function makeTarget(proto, anchor) {
     unplaced: false,
     reordered: false,
     placedIn: null,
-    voided: false, // a voided ancestor ended this pass
+    voided: false, // do not append: a voided ancestor, or a commit that has taken this pass
     buckets: new Map(),
   };
 }
@@ -167,6 +167,8 @@ function touch(target) {
     target.state = STAGED;
     return;
   }
+  // a pass started over closes the passes it opened
+  if (target.state === STAGED) voidOpened(target);
   call(target);
 }
 
@@ -511,11 +513,16 @@ function park(segment) {
 }
 
 // end only at flush. a voided pass frees nothing.
+// the list as taken. a throw keeps the front occupant. a push during end waits for the next flush.
 function flushEnds(binding, sink = disposeTarget) {
-  if (!binding.leavers) return;
-  const batch = binding.leavers;
-  binding.leavers = null;
-  for (const occupant of batch) end(binding, occupant, sink);
+  const leavers = binding.leavers;
+  if (!leavers) return;
+  const count = leavers.length;
+  for (let index = 0; index < count; index++) {
+    end(binding, leavers[0], sink);
+    leavers.shift();
+  }
+  if (binding.leavers === leavers && !leavers.length) binding.leavers = null;
 }
 
 function sweepSegment(segment, sink) {
@@ -569,8 +576,11 @@ function commitTarget(target) {
         debug.enabled && debug.emit({ type: 'sealed', target: current, pass: current.pass });
         continue;
       }
-      if (current.state === STAGED) settle(current, 'flush', flushTarget);
-      else if (current.unplaced) settle(current, 'place', placeTarget);
+      if (current.state === STAGED) {
+        // taken: a render starts over, a commit retries. a flush that returns leaves it idle.
+        current.voided = true;
+        settle(current, 'flush', flushTarget);
+      } else if (current.unplaced) settle(current, 'place', placeTarget);
       for (const child of current.children) queue.push(child);
     }
 
@@ -592,7 +602,6 @@ function withCause(ev, run) {
 }
 
 function placeTarget(target) {
-  target.unplaced = false;
   extractPlaced(target.anchor);
   flushEnds(target.anchor);
   let prevEnd = null;
@@ -602,15 +611,14 @@ function placeTarget(target) {
   }
   if (target.head.next) deliver(target);
   notePlaced(target);
+  target.unplaced = false;
 }
 
 function flushTarget(target) {
   if (!target.anchor) throw new Error('temtie/core: cannot commit an unanchored capture');
-  const boundary = target.cursor,
+  const pass = target.pass,
+    boundary = target.cursor,
     reshaped = target.unplaced || target.reordered || boundary.next !== null;
-  target.state = IDLE;
-  target.unplaced = false;
-  target.reordered = false;
   extractPlaced(target.anchor);
   flushEnds(target.anchor);
 
@@ -621,13 +629,15 @@ function flushTarget(target) {
     if (segment.builder.parent(segment.start)) segment.builder.extract(segment.start, segment.end);
   }
   boundary.next = null;
+  // prune with the completed sweep, before a write can throw or record another pass.
+  if (reshaped) pruneBuckets(target);
 
   let prevEnd = null;
   if (reshaped)
     for (let segment = target.head.next; segment; segment = segment.next) {
       if (segment.sunk) {
-        segment.sunk = false;
         if (!inPlace(target, segment, prevEnd)) park(segment);
+        segment.sunk = false;
       }
       prevEnd = segment.end;
     }
@@ -643,9 +653,13 @@ function flushTarget(target) {
     }
     prevEnd = segment.end;
   }
-  if (reshaped) pruneBuckets(target);
   deliver(target);
   notePlaced(target);
+  // only settle this pass. a callback may have recorded another one.
+  if (target.pass !== pass) return;
+  target.state = IDLE;
+  target.unplaced = false;
+  target.reordered = false;
 }
 
 function deliver(target) {
@@ -671,13 +685,15 @@ function place(target, segment, prevEnd) {
     anchor = target.anchor,
     after = prevEnd ?? anchor.dest.after?.(anchor, builder),
     container = anchor.dest.container(anchor);
-  debug.enabled && debug.assert(segment.parked || builder.parent(segment.start),
-    'temtie/core: cannot place a segment whose nodes left the medium',
-    { assert: 'detached-start', target, segment, destination: container });
-  const content = segment.parked ?? builder.extract(segment.start, segment.end);
-  segment.parked = null;
+  if (!segment.parked) {
+    debug.enabled && debug.assert(builder.parent(segment.start),
+      'temtie/core: cannot place a segment whose nodes left the medium',
+      { assert: 'detached-start', target, segment, destination: container });
+    segment.parked = builder.extract(segment.start, segment.end);
+  }
   debug.enabled && debug.emit({ type: 'move', target, segment, container, after });
-  builder.insert(container, content, after);
+  builder.insert(container, segment.parked, after);
+  segment.parked = null;
   return true;
 }
 
