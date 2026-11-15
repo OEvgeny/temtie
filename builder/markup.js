@@ -192,7 +192,7 @@ export class MarkupBuilder {
     if (value == null || value === false) return [];
     if (Array.isArray(value)) return value.flatMap(this.toNodes, this);
     if (isIterable(value)) return Array.from(value).flatMap(this.toNodes, this);
-    if (value && value[NODE]) return [value];
+    if (value && value[NODE]) return value.type === '#fragment' ? [...value.children] : [value];
     return [this.createText(String(value))];
   }
 
