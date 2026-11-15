@@ -642,6 +642,8 @@ function flushTarget(target) {
     boundary = target.cursor,
     reshaped = target.unplaced || target.reordered || boundary.next !== null;
   if (target.disposing) disposeTarget(target);
+  // before a hook runs. a release can open another pass, and a later prune would drop sites that pass did not touch.
+  if (reshaped) pruneBuckets(target);
   extractPlaced(target.anchor);
   flushEnds(target.anchor);
 
@@ -652,8 +654,6 @@ function flushTarget(target) {
     if (segment.builder.parent(segment.start)) segment.builder.extract(segment.start, segment.end);
   }
   boundary.next = null;
-  // prune with the completed sweep, before a write can throw or record another pass.
-  if (reshaped) pruneBuckets(target);
 
   let prevEnd = null;
   if (reshaped)
