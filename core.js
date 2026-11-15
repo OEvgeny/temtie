@@ -76,7 +76,7 @@ export function skip(inst) {
 function voidOpened(target, since = target.pass) {
   for (const child of target.children) {
     voidOpened(child, since);
-    if (child.state === STAGED && child.pass > since) child.closed = true;
+    if (child.state === STAGED && child.pass > since) child.voided = true;
   }
 }
 
@@ -98,7 +98,7 @@ function call(target, via = 'render') {
   target.state = STAGED;
   target.pass = ++PASS;
   target.cursor = target.head;
-  target.closed = false;
+  target.voided = false;
   debug.enabled && debug.emit({ type: 'call', target, pass: target.pass, via });
 }
 
@@ -131,10 +131,10 @@ function makeTarget(proto, anchor) {
     cursor: head,
     pass: 0,
     state: IDLE,
-    moved: false, // orthogonal: an idle target can still need placement
+    unplaced: false, // orthogonal: an idle target can still need placement
     reordered: false, // the chain was relinked since the last commit
-    home: null, // the hole its content was last placed in
-    closed: false, // a voided ancestor ended the pass this one was staged in
+    placedIn: null, // the hole its content was last placed in
+    voided: false, // a voided ancestor ended the pass this one was staged in
     buckets: new Map(),
   };
 }
@@ -186,7 +186,7 @@ function makeChannel(builder) {
 }
 
 function touch(target) {
-  if (target.state === STAGED && !target.closed) return;
+  if (target.state === STAGED && !target.voided) return;
   if (target.state === SEALED) {
     target.state = STAGED;
     return;
@@ -253,7 +253,7 @@ function makeBinding(builder, fragment, hole) {
     container: null,
     occupant: null,
     leavers: null,
-    resident: null, // the body whose content was last placed in this hole
+    placedBody: null, // the body whose content was last placed in this hole
     handle: null,
     bag: dest.kind === HOLE.SPREAD ? {} : null,
   };
@@ -339,12 +339,12 @@ const DEST = {
   },
   [HOLE.META]: {
     kind: HOLE.META,
-    closed: true, // takes no target from the outside, only an instance body
+    instanceOnly: true, // takes no target from the outside, only an instance body
     container: (binding) => binding.node,
   },
   [HOLE.SPREAD]: {
     kind: HOLE.SPREAD,
-    eager: true, // re-diffs every flush: the bag may be the same object mutated
+    alwaysWrite: true, // re-diffs every flush: the bag may be the same object mutated
     write(binding, value) {
       debug.enabled && debug.emit({ type: 'write', binding, value });
       const next = value == null ? {} : Object(value);
@@ -394,7 +394,7 @@ function resolveSegment(target, segment, values) {
 function holds(binding, raw) {
   const occupant = binding.occupant;
   if (!occupant) return !binding.dest.write;
-  return !binding.dest.eager && occupant.kind === 'plain' && same(occupant.prev, raw);
+  return !binding.dest.alwaysWrite && occupant.kind === 'plain' && same(occupant.prev, raw);
 }
 
 function resolvePlain(binding) {
@@ -408,7 +408,7 @@ function resolvePlain(binding) {
 function resolveBody(parent, binding, ref) {
   // a closed hole has no marker, so its content has no defined placement —
   // but an instance body may still anchor there (resolveInstance does)
-  if (binding.dest.closed)
+  if (binding.dest.instanceOnly)
     throw new Error('temtie/core: a meta hole cannot host a target');
   if (!binding.dest.container)
     throw new Error('temtie/core: a spread hole cannot host a target');
@@ -480,7 +480,7 @@ function hook(parent, child, binding) {
   child.parent?.children.delete(child);
   child.parent = parent;
   child.anchor = binding;
-  child.moved = true;
+  child.unplaced = true;
   parent.children.add(child);
 }
 
@@ -506,7 +506,7 @@ function displace(binding) {
     body.parent?.children.delete(body);
     body.parent = null;
     body.anchor = null;
-    body.moved = false;
+    body.unplaced = false;
   }
 }
 
@@ -520,27 +520,27 @@ function end(binding, occupant, sink) {
 function endBody(body, sink) {
   if (body.anchor) return; // moved on: the hole it left lifts its content out
   evictChain(body.head.next);
-  if (body.home?.resident === body) body.home.resident = null;
-  body.home = null;
+  if (body.placedIn?.placedBody === body) body.placedIn.placedBody = null;
+  body.placedIn = null;
   sink(body);
 }
 
 // a hole lifts out the content of a body that has moved on before the hole is
 // rewritten or removed, so the content does not leave with it
-function releaseResident(binding) {
-  const body = binding.resident;
+function extractPlaced(binding) {
+  const body = binding.placedBody;
   if (!body || body.anchor === binding) return;
-  binding.resident = null;
-  if (body.home === binding) body.home = null;
+  binding.placedBody = null;
+  if (body.placedIn === binding) body.placedIn = null;
   evictChain(body.head.next);
 }
 
-function noteHome(target) {
+function notePlaced(target) {
   const binding = target.anchor;
   if (!binding || binding.dest.kind === ROOT) return;
-  if (target.home && target.home !== binding && target.home.resident === target) target.home.resident = null;
-  target.home = binding;
-  binding.resident = target;
+  if (target.placedIn && target.placedIn !== binding && target.placedIn.placedBody === target) target.placedIn.placedBody = null;
+  target.placedIn = binding;
+  binding.placedBody = target;
 }
 
 function evictChain(segment) {
@@ -549,7 +549,7 @@ function evictChain(segment) {
 
 function park(segment) {
   // content that moved out of this range steps out before the range leaves
-  for (const binding of segment.bindings) releaseResident(binding);
+  for (const binding of segment.bindings) extractPlaced(binding);
   if (segment.builder.parent(segment.start))
     segment.parked = segment.builder.extract(segment.start, segment.end);
 }
@@ -565,7 +565,7 @@ function flushEnds(binding, sink = disposeTarget) {
 // a disposed segment's standing occupant is displaced like any other leaver
 function sweepSegment(segment, sink) {
   for (const binding of segment.bindings) {
-    releaseResident(binding);
+    extractPlaced(binding);
     displace(binding);
     flushEnds(binding, sink);
   }
@@ -584,7 +584,7 @@ function disposeTarget(target) {
     current.buckets.clear();
     current.children.clear();
     current.state = IDLE;
-    current.moved = false;
+    current.unplaced = false;
   }
 }
 
@@ -620,7 +620,7 @@ function commitTarget(target) {
         continue;
       }
       if (current.state === STAGED) settle(current, 'flush', flushTarget);
-      else if (current.moved) settle(current, 'place', placeTarget);
+      else if (current.unplaced) settle(current, 'place', placeTarget);
       for (const child of current.children) queue.push(child);
     }
 
@@ -643,8 +643,8 @@ function withCause(ev, run) {
 
 // an idle body whose anchor moved is placed, not re-rendered
 function placeTarget(target) {
-  target.moved = false;
-  releaseResident(target.anchor);
+  target.unplaced = false;
+  extractPlaced(target.anchor);
   flushEnds(target.anchor);
   let prevEnd = null;
   for (let segment = target.head.next; segment; segment = segment.next) {
@@ -652,17 +652,17 @@ function placeTarget(target) {
     prevEnd = segment.end;
   }
   if (target.head.next) deliver(target); // an empty body delivers nothing
-  noteHome(target);
+  notePlaced(target);
 }
 
 function flushTarget(target) {
   if (!target.anchor) throw new Error('temtie/core: cannot commit an unanchored capture');
   const boundary = target.cursor,
-    reshaped = target.moved || target.reordered || boundary.next !== null;
+    reshaped = target.unplaced || target.reordered || boundary.next !== null;
   target.state = IDLE;
-  target.moved = false;
+  target.unplaced = false;
   target.reordered = false;
-  releaseResident(target.anchor);
+  extractPlaced(target.anchor);
   flushEnds(target.anchor);
 
   // what leaves and what sank step out first: left in the medium, either
@@ -699,7 +699,7 @@ function flushTarget(target) {
   }
   if (reshaped) pruneBuckets(target);
   deliver(target);
-  noteHome(target);
+  notePlaced(target);
 }
 
 function deliver(target) {
@@ -741,14 +741,14 @@ function place(target, segment, prevEnd) {
 const same = (a, b) => a === b || (a !== a && b !== b);
 
 function flushBinding(binding, values) {
-  releaseResident(binding);
+  extractPlaced(binding);
   flushEnds(binding);
   const occupant = binding.occupant;
   if (!occupant) return;
   if (occupant.kind === 'instance') occupant.hooks.commit?.(handleOf(binding));
   else if (occupant.kind === 'plain') {
     const value = values[binding.slot];
-    if (binding.dest.eager || !same(value, occupant.prev)) {
+    if (binding.dest.alwaysWrite || !same(value, occupant.prev)) {
       binding.dest.write(binding, value);
       occupant.prev = value;
     }
