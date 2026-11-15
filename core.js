@@ -231,7 +231,7 @@ function makeBinding(builder, fragment, hole) {
     leavers: null,
     placedBody: null,
     handle: null,
-    bag: dest.kind === HOLE.SPREAD ? {} : null,
+    bag: dest.kind === HOLE.SPREAD ? Object.create(null) : null,
   };
 }
 
@@ -312,15 +312,22 @@ const DEST = {
   },
   [HOLE.SPREAD]: {
     kind: HOLE.SPREAD,
-    alwaysWrite: true, // stored bag is the caller's object. mutating it and passing it again writes nothing
+    // the bag is this hole's record, not the caller's object. a mutated object passed again is the same value.
     write(binding, value) {
       debug.enabled && debug.emit({ type: 'write', binding, value });
-      const next = value == null ? {} : Object(value);
-      for (const name of Object.keys(binding.bag))
-        if (!(name in next)) binding.builder.unsetProp(binding.node, name);
+      const next = value == null ? {} : Object(value),
+        bag = binding.bag;
+      // record each key as it lands: a throw leaves the bag matching the node.
+      for (const name of Object.keys(bag))
+        if (!(name in next)) {
+          binding.builder.unsetProp(binding.node, name);
+          delete bag[name];
+        }
       for (const name of Object.keys(next))
-        if (binding.bag[name] !== next[name]) binding.builder.setProp(binding.node, name, next[name]);
-      binding.bag = next;
+        if (bag[name] !== next[name]) {
+          binding.builder.setProp(binding.node, name, next[name]);
+          bag[name] = next[name];
+        }
     }
   }
 };
@@ -360,7 +367,7 @@ function resolveSegment(target, segment, values) {
 function holds(binding, raw) {
   const occupant = binding.occupant;
   if (!occupant) return !binding.dest.write;
-  return !binding.dest.alwaysWrite && occupant.kind === 'plain' && same(occupant.prev, raw);
+  return occupant.kind === 'plain' && same(occupant.prev, raw);
 }
 
 function resolvePlain(binding) {
@@ -731,7 +738,9 @@ function flushBinding(binding, values) {
   if (occupant.kind === 'instance') occupant.hooks.commit?.(handleOf(binding));
   else if (occupant.kind === 'plain') {
     const value = values[binding.slot];
-    if (binding.dest.alwaysWrite || !same(value, occupant.prev)) {
+    if (!same(value, occupant.prev)) {
+      // a throw may leave partial changes, so the old value is no longer settled.
+      occupant.prev = UNSET;
       binding.dest.write(binding, value);
       occupant.prev = value;
     }
