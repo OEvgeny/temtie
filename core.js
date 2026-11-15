@@ -342,7 +342,7 @@ function resolveSegment(target, segment, values) {
       }
       if (raw[PRIVATE]) {
         clean = false;
-        resolveBody(target, binding, raw[PRIVATE]);
+        resolveBody(target, binding, raw[PRIVATE], values);
         continue;
       }
     }
@@ -368,7 +368,10 @@ function resolvePlain(binding) {
   debug.enabled && debug.emit({ type: 'claim', binding, occupant: binding.occupant });
 }
 
-function resolveBody(parent, binding, ref) {
+// a fresh capture does not take a body that another value of the same call carries elsewhere.
+const carried = (body, values) => values.some((value) => value?.[PRIVATE]?.target === body);
+
+function resolveBody(parent, binding, ref, values) {
   // meta has no marker. a target cannot anchor there. an instance body can.
   if (binding.dest.instanceOnly)
     throw new Error('temtie/core: a meta hole cannot host a target');
@@ -377,9 +380,9 @@ function resolveBody(parent, binding, ref) {
 
   const occupant = binding.occupant,
     child = ref.target
-      ?? (occupant?.kind === 'body' ? occupant.body : null)
+      ?? (occupant?.kind === 'body' && !carried(occupant.body, values) ? occupant.body : null)
       // a body displaced and not flushed is still committed. a fresh capture reuses it.
-      ?? binding.leavers?.findLast((occ) => occ.kind === 'body' && !occ.body.anchor)?.body
+      ?? binding.leavers?.findLast((occ) => occ.kind === 'body' && !occ.body.anchor && !carried(occ.body, values))?.body
       ?? makeTarget(parent.proto, null);
   if (child.anchor?.dest.kind === ROOT)
     throw new Error('temtie/core: a mounted root cannot be interpolated into a template');
