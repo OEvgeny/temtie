@@ -8,9 +8,6 @@ const UNSET = Symbol('temtie.unset');
 const VALUE = Symbol.for('temtie.value');
 const ROOT = 'root';
 
-// the hole kinds are the shared vocabulary between the parser (which emits
-// them) and DEST (which answers for them). they live here because what a
-// hole *is* belongs to the core; how one is spelled is the builder's job.
 export const TEMPLATE_HOLE_TYPES = {
   CHILD: 'child',
   ATTR: 'attr',
@@ -19,19 +16,10 @@ export const TEMPLATE_HOLE_TYPES = {
 };
 const HOLE = TEMPLATE_HOLE_TYPES;
 
-// one clock for all targets: a stale structure can never masquerade as
-// fresh by crossing targets
+// one pass clock. a stamp from another target is not fresh.
 let PASS = 0;
 
 const IDLE = 'idle', STAGED = 'staged', SEALED = 'sealed';
-
-// the core turns on two axes. a destination is how a hole reaches the
-// medium; an occupant is what holds it — a plain value, a body (a target
-// named by a ref), or a contract instance with a body of its own. a ref
-// carrying a target lends it to the hole; an empty ref inherits the hole's
-// target. one disposal law covers every occupant: what a commit does not
-// restage leaves the medium. disposal reaches bodies, not names — a name
-// interpolated again grows a fresh body.
 
 /** @type {Mount} */
 export function mount(container, { builders } = {}) {
@@ -56,9 +44,6 @@ export function commit(inst) {
   if (ref.target) commitTarget(ref.target);
 }
 
-// skip() seals the target. commit then treats the seal as a wall — no
-// flush, no descent — so nothing the voided pass staged can surface; the
-// committed output stands and stays borrowable until a render reopens it.
 /** @type {Skip} */
 export function skip(inst) {
   const ref = inst?.[PRIVATE];
@@ -70,9 +55,7 @@ export function skip(inst) {
   target.state = SEALED;
 }
 
-// a voided pass closes the passes it opened: a descendant whose pass began
-// after this one keeps its draft, but a render starts it over instead of
-// appending. One staged before it keeps its own
+// close descendant passes that started after this one. a pass staged earlier stays open.
 function voidOpened(target, since = target.pass) {
   for (const child of target.children) {
     voidOpened(child, since);
@@ -80,8 +63,7 @@ function voidOpened(target, since = target.pass) {
   }
 }
 
-// reset() stages emptiness, not destruction: the committed segments stay
-// borrowable, so a render before the next commit can rebuild over them.
+// stage an empty pass. committed segments stay until commit and can be reused before then.
 /** @type {Reset} */
 export function reset(inst) {
   const ref = inst?.[PRIVATE];
@@ -92,8 +74,7 @@ export function reset(inst) {
   call(target, 'reset');
 }
 
-// 'call' is a point event, never paired: a pass may be re-staged into the
-// next before it ever commits, so nothing ever closes it.
+// call is not paired. a pass may be replaced before it commits.
 function call(target, via = 'render') {
   target.state = STAGED;
   target.pass = ++PASS;
@@ -125,23 +106,20 @@ function makeTarget(proto, anchor) {
     anchor,
     parent: null,
     children: new Set(),
-    // one chain, one cursor: live content is head..cursor in emission
-    // order, everything past the cursor awaits the flush sweep
+    // live segments are head..cursor. the tail is swept at flush.
     head,
     cursor: head,
     pass: 0,
     state: IDLE,
-    unplaced: false, // orthogonal: an idle target can still need placement
-    reordered: false, // the chain was relinked since the last commit
-    placedIn: null, // the hole its content was last placed in
-    voided: false, // a voided ancestor ended the pass this one was staged in
+    unplaced: false,
+    reordered: false,
+    placedIn: null,
+    voided: false, // a voided ancestor ended this pass
     buckets: new Map(),
   };
 }
 
-// compiling is the builder's; site identity is the core's. the cache holds a
-// record per strings array so a compiler may share one compiled template
-// without collapsing separate call sites into one segment bucket.
+// cache by strings array, per builder. one compiled template must not merge two call sites.
 const SITES = new WeakMap(); // builder → strings → { template }
 
 function compile(builder, strings, target) {
@@ -168,8 +146,6 @@ function compile(builder, strings, target) {
 function makeChannel(builder) {
   return function channel(strings, ...values) {
     const target = this[PRIVATE].target;
-    // the pass opens before the template compiles: an ad-hoc compile is a
-    // cost of the pass that first touched the site, and the event says so
     touch(target);
     const site = compile(builder, strings, target),
       template = site.template,
@@ -194,10 +170,7 @@ function touch(target) {
   call(target);
 }
 
-// four values carry no identity: a channel that carries one of them is an
-// occurrence matched by position, never a row held under a key. Every other
-// value keys, `0`, `''` and `NaN` included, and a value that keys once keys the
-// same way in every pass.
+// undefined, null, true, and false are not keys. 0, '', and NaN are.
 const carriesIdentity = (key) => key !== undefined && key !== null && key !== true && key !== false;
 
 function takeSegment(target, site, values) {
@@ -238,7 +211,7 @@ function makeSegment(site) {
   return { template, builder, start, end, bindings, values: [], prev: null, next: null, pass: 0, parked: null, sunk: false, clean: false };
 }
 
-// a child marker never moves and never leaves: content lives after it
+// the child marker stays. content is the nodes after it.
 function makeBinding(builder, fragment, hole) {
   const dest = DEST[hole.type],
     node = builder.resolve(fragment, hole.path);
@@ -253,18 +226,16 @@ function makeBinding(builder, fragment, hole) {
     container: null,
     occupant: null,
     leavers: null,
-    placedBody: null, // the body whose content was last placed in this hole
+    placedBody: null,
     handle: null,
     bag: dest.kind === HOLE.SPREAD ? {} : null,
   };
 }
 
-// splices the segment in after the cursor, preserving the borrowable tail
 function emit(target, segment) {
   if (segment === target.cursor) return;
   segment.pass = target.pass;
-  // one segment standing between the cursor and the emitted one has sunk:
-  // it steps behind, so the rest of the chain stays where it is
+  // one segment between the cursor and this one moves behind this one.
   const ahead = target.cursor.next;
   if (ahead && ahead !== segment && ahead.next === segment) {
     ahead.next = segment.next;
@@ -293,17 +264,12 @@ function emit(target, segment) {
   target.reordered = true;
 }
 
-// a destination answers for its hole kind: where a hosted body lives
-// (container/after), how a value reaches the medium (write), how a body is
-// handed over (deliver). the capabilities are the law: no write — a value
-// never reaches the medium; no container — nothing can anchor there.
+// no write: the value is not applied. no container: a body cannot anchor.
 const DEST = {
   [ROOT]: {
     kind: ROOT,
     container: (anchor) => anchor.node,
-    // a root lays one marker after whatever the container already holds, so
-    // its first segment sits after an anchor like every other segment does.
-    // the container is the caller's: a marker it lost is laid again
+    // insert the root marker after the container's existing children. if it is missing, lay it again.
     after(anchor, builder) {
       if (!anchor.marker || builder.parent(anchor.marker) !== anchor.node)
         anchor.marker = lay(anchor, builder);
@@ -331,20 +297,19 @@ const DEST = {
       debug.enabled && debug.emit({ type: 'write', binding, value });
       binding.builder.setProp(binding.node, binding.prop, value);
     },
-    // handover, never reconciliation: the receiver decides what a
-    // re-assignment means
+    // repeated deliver is the receiver's problem. core does not diff it.
     deliver(binding) {
       binding.builder.setProp(binding.node, binding.prop, binding.container ??= binding.builder.createRoot());
     }
   },
   [HOLE.META]: {
     kind: HOLE.META,
-    instanceOnly: true, // takes no target from the outside, only an instance body
+    instanceOnly: true,
     container: (binding) => binding.node,
   },
   [HOLE.SPREAD]: {
     kind: HOLE.SPREAD,
-    alwaysWrite: true, // re-diffs every flush: the bag may be the same object mutated
+    alwaysWrite: true, // stored bag is the caller's object. mutating it and passing it again writes nothing
     write(binding, value) {
       debug.enabled && debug.emit({ type: 'write', binding, value });
       const next = value == null ? {} : Object(value);
@@ -363,7 +328,6 @@ function lay(anchor, builder) {
   return marker;
 }
 
-// a segment is clean when the flush would write none of its holes
 function resolveSegment(target, segment, values) {
   segment.values = values;
   let clean = true;
@@ -390,7 +354,6 @@ function resolveSegment(target, segment, values) {
   segment.clean = clean;
 }
 
-// whether the hole already holds the value, or never writes one (a key)
 function holds(binding, raw) {
   const occupant = binding.occupant;
   if (!occupant) return !binding.dest.write;
@@ -406,8 +369,7 @@ function resolvePlain(binding) {
 }
 
 function resolveBody(parent, binding, ref) {
-  // a closed hole has no marker, so its content has no defined placement —
-  // but an instance body may still anchor there (resolveInstance does)
+  // meta has no marker. a target cannot anchor there. an instance body can.
   if (binding.dest.instanceOnly)
     throw new Error('temtie/core: a meta hole cannot host a target');
   if (!binding.dest.container)
@@ -416,8 +378,7 @@ function resolveBody(parent, binding, ref) {
   const occupant = binding.occupant,
     child = ref.target
       ?? (occupant?.kind === 'body' ? occupant.body : null)
-      // a body the hole gave up in a pass that never flushed is still the
-      // medium's: a fresh capture takes it back like the one the hole holds
+      // a body displaced and not flushed is still committed. a fresh capture reuses it.
       ?? binding.leavers?.findLast((occ) => occ.kind === 'body' && !occ.body.anchor)?.body
       ?? makeTarget(parent.proto, null);
   if (child.anchor?.dest.kind === ROOT)
@@ -429,19 +390,15 @@ function resolveBody(parent, binding, ref) {
   if (occupant?.kind !== 'body' || occupant.body !== child) {
     displace(binding);
     binding.occupant = { kind: 'body', body: child };
-    // a body this hole gave up earlier in the pass is taken back, not ended
+    // taking this body back removes it from leavers. it is not ended.
     if (binding.leavers) binding.leavers = binding.leavers.filter((occ) => occ.body !== child);
     debug.enabled && debug.emit({ type: 'claim', binding, occupant: binding.occupant });
   }
   hook(parent, child, binding);
 }
 
-// the VALUE contract: { [Symbol.for('temtie.value')]: init, props }. init
-// runs once per claim, its closure is the instance state, and it returns
-// the hooks (a bare function reads as { render }). render(t) goes through
-// the supplied body, so render-phase work is DOM-pure by construction.
-// commit(handle) runs at every flush of the owning segment; release(handle)
-// fires when the claim ends — displaced, or disposed with its segment.
+// [Symbol.for('temtie.value')]: init. init(inst, ...props) runs once per claim and returns hooks, or a render function.
+// commit(handle) runs on each flush of the segment. release(handle) runs when the claim ends.
 function resolveInstance(parent, binding, raw, init) {
   if (typeof init !== 'function')
     throw new TypeError('temtie/core: a contract value must carry an init function under Symbol.for("temtie.value")');
@@ -451,8 +408,7 @@ function resolveInstance(parent, binding, raw, init) {
   const props = raw.props ?? [];
   let occupant = binding.occupant;
   if (occupant?.kind !== 'instance' || occupant.init !== init) {
-    // a claim the hole gave up in a pass that never flushed is taken back,
-    // its init and state with it: the hole ends nothing that never flushed
+    // same init, pass not flushed: reuse the claim. do not call init again.
     const back = binding.leavers?.findLast((occ) => occ.kind === 'instance' && occ.init === init);
     displace(binding);
     const ref = back?.ref ?? makeRef(makeTarget(parent.proto, null));
@@ -466,7 +422,7 @@ function resolveInstance(parent, binding, raw, init) {
       occupant.hooks = typeof made === 'function' ? { render: made } : made ?? {};
     }
   } else {
-    hook(parent, occupant.body, binding); // the body follows its binding every pass
+    hook(parent, occupant.body, binding);
   }
   occupant.hooks.render?.(occupant.ref.inst, ...props);
 }
@@ -484,8 +440,7 @@ function hook(parent, child, binding) {
   parent.children.add(child);
 }
 
-// the old hole forgets a body occupant. an instance still ends at flush —
-// release and clear — and endBody does not dispose the body that moved on
+// drop a moved body occupant. displace a moved instance so release and clear run at flush. do not dispose the body.
 function leave(binding, body) {
   if (binding.occupant?.body === body && binding.occupant.kind === 'instance') displace(binding);
   else if (binding.occupant?.body === body) binding.occupant = null;
@@ -493,8 +448,7 @@ function leave(binding, body) {
     binding.leavers = binding.leavers.filter((occupant) => occupant.kind === 'instance' || occupant.body !== body);
 }
 
-// displacing is bookkeeping: the DOM stays put until the ends fire at
-// flush. a leaver another hole already claimed this pass keeps that claim
+// record the occupant. do not change the medium. do not unhook a body already anchored at another hole.
 function displace(binding) {
   const occupant = binding.occupant;
   if (!occupant) return;
@@ -518,15 +472,14 @@ function end(binding, occupant, sink) {
 }
 
 function endBody(body, sink) {
-  if (body.anchor) return; // moved on: the hole it left lifts its content out
+  if (body.anchor) return; // still anchored: do not dispose
   evictChain(body.head.next);
   if (body.placedIn?.placedBody === body) body.placedIn.placedBody = null;
   body.placedIn = null;
   sink(body);
 }
 
-// a hole lifts out the content of a body that has moved on before the hole is
-// rewritten or removed, so the content does not leave with it
+// extract a body last placed here once it is no longer anchored here, before this hole is rewritten or removed.
 function extractPlaced(binding) {
   const body = binding.placedBody;
   if (!body || body.anchor === binding) return;
@@ -548,13 +501,13 @@ function evictChain(segment) {
 }
 
 function park(segment) {
-  // content that moved out of this range steps out before the range leaves
+  // extract a placed body that has left before extracting this range.
   for (const binding of segment.bindings) extractPlaced(binding);
   if (segment.builder.parent(segment.start))
     segment.parked = segment.builder.extract(segment.start, segment.end);
 }
 
-// ends fire only at flush: a voided pass frees nothing
+// end only at flush. a voided pass frees nothing.
 function flushEnds(binding, sink = disposeTarget) {
   if (!binding.leavers) return;
   const batch = binding.leavers;
@@ -562,7 +515,6 @@ function flushEnds(binding, sink = disposeTarget) {
   for (const occupant of batch) end(binding, occupant, sink);
 }
 
-// a disposed segment's standing occupant is displaced like any other leaver
 function sweepSegment(segment, sink) {
   for (const binding of segment.bindings) {
     extractPlaced(binding);
@@ -571,7 +523,6 @@ function sweepSegment(segment, sink) {
   }
 }
 
-// a disposed target is left empty but valid: its ref renders again from scratch
 function disposeTarget(target) {
   const queue = [target];
   const sink = (child) => { queue.push(child); };
@@ -588,8 +539,6 @@ function disposeTarget(target) {
   }
 }
 
-// a segment not borrowed this pass is dropped at flush; its bucket entry
-// goes too, matched by the same pass stamp
 function pruneBuckets(target) {
   for (const [site, bucket] of target.buckets) {
     if (bucket.pass !== target.pass) {
@@ -602,9 +551,7 @@ function pruneBuckets(target) {
   }
 }
 
-// flush only what was staged, parents before children; the queue keeps deep
-// trees off the call stack. the forest hook() enforces means each target is
-// reachable by one path, so the walk visits each exactly once
+// flush staged targets, parents before children. one parent per target, so each target is visited once.
 function commitTarget(target) {
   const root = debug.enabled && debug.emit({
     type: 'commit', target, pass: target.pass,
@@ -615,7 +562,7 @@ function commitTarget(target) {
     const queue = [target];
     for (let index = 0; index < queue.length; index++) {
       const current = queue[index];
-      if (current.state === SEALED) { // the wall: no flush, no descent
+      if (current.state === SEALED) {
         debug.enabled && debug.emit({ type: 'sealed', target: current, pass: current.pass });
         continue;
       }
@@ -641,7 +588,6 @@ function withCause(ev, run) {
   finally { debug.cause = cause; }
 }
 
-// an idle body whose anchor moved is placed, not re-rendered
 function placeTarget(target) {
   target.unplaced = false;
   extractPlaced(target.anchor);
@@ -651,7 +597,7 @@ function placeTarget(target) {
     place(target, segment, prevEnd);
     prevEnd = segment.end;
   }
-  if (target.head.next) deliver(target); // an empty body delivers nothing
+  if (target.head.next) deliver(target);
   notePlaced(target);
 }
 
@@ -665,8 +611,7 @@ function flushTarget(target) {
   extractPlaced(target.anchor);
   flushEnds(target.anchor);
 
-  // what leaves and what sank step out first: left in the medium, either
-  // would make every segment after it look out of place
+  // extract the tail and park sunk segments before placing. a segment left behind makes later placement tests fail.
   for (let segment = boundary.next; segment; segment = segment.next) {
     debug.enabled && debug.emit({ type: 'drop', target, segment });
     sweepSegment(segment, disposeTarget);
@@ -684,9 +629,7 @@ function flushTarget(target) {
       prevEnd = segment.end;
     }
 
-  // in an unchanged chain a clean segment is skipped, until a placement moves
-  // and every later one is asked again. The first is always asked: its anchor
-  // re-lays a marker the container may have lost
+  // skip clean segments until one is placed. always place the first: the anchor marker may be missing.
   const first = target.head.next;
   let still = !reshaped;
   prevEnd = null;
@@ -709,7 +652,6 @@ function deliver(target) {
   anchor.dest.deliver(anchor);
 }
 
-// whether the medium already has the segment where the target would place it
 function inPlace(target, segment, prevEnd) {
   const builder = segment.builder,
     anchor = target.anchor,
@@ -719,7 +661,6 @@ function inPlace(target, segment, prevEnd) {
     : builder.parent(segment.start) === anchor.dest.container(anchor);
 }
 
-// answers whether the segment moved
 function place(target, segment, prevEnd) {
   if (!segment.parked && inPlace(target, segment, prevEnd)) return false;
 
@@ -737,7 +678,7 @@ function place(target, segment, prevEnd) {
   return true;
 }
 
-// SameValueZero: a hole holding NaN is settled when it is handed NaN again
+// SameValueZero. NaN equals NaN.
 const same = (a, b) => a === b || (a !== a && b !== b);
 
 function flushBinding(binding, values) {
@@ -753,14 +694,14 @@ function flushBinding(binding, values) {
       occupant.prev = value;
     }
   }
-  // a body flushes itself: it is a target in the commit walk
+  // a body is flushed as its own target.
 }
 
 function handleOf(binding) {
   return binding.handle ??= makeHandle(binding);
 }
 
-// set() exists only where the destination writes — a meta handle observes
+// set() exists only where the destination writes. a meta handle has none.
 function makeHandle(binding) {
   const dest = binding.dest,
     handle = {
