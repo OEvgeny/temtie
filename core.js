@@ -115,6 +115,7 @@ function makeTarget(proto, anchor) {
     reordered: false,
     placedIn: null,
     voided: false, // do not append: a voided ancestor, or a commit that has taken this pass
+    disposing: null, // bodies left to dispose after a throw
     buckets: new Map(),
   };
 }
@@ -414,7 +415,7 @@ function resolveInstance(parent, binding, raw, init) {
   let occupant = binding.occupant;
   if (occupant?.kind !== 'instance' || occupant.init !== init) {
     // same init, pass not flushed: reuse the claim. do not call init again.
-    const back = binding.leavers?.findLast((occ) => occ.kind === 'instance' && occ.init === init);
+    const back = binding.leavers?.findLast((occ) => occ.kind === 'instance' && occ.init === init && !occ.released);
     displace(binding);
     const ref = back?.ref ?? makeRef(makeTarget(parent.proto, null));
     occupant = binding.occupant = back
@@ -471,7 +472,11 @@ function displace(binding) {
 
 function end(binding, occupant, sink) {
   debug.enabled && debug.emit({ type: 'end', binding, occupant });
-  if (occupant.kind === 'instance') occupant.hooks.release?.(handleOf(binding));
+  // release once per claim: a retry after a later step threw does not release again.
+  if (occupant.kind === 'instance' && !occupant.released) {
+    occupant.hooks.release?.(handleOf(binding));
+    occupant.released = true;
+  }
   binding.dest.clear?.(binding, occupant);
   if (occupant.body) endBody(occupant.body, sink);
 }
@@ -533,11 +538,25 @@ function sweepSegment(segment, sink) {
   }
 }
 
+// the queue stays on the target until it drains: a throw leaves the rest for the next flush.
 function disposeTarget(target) {
-  const queue = [target];
+  const queue = target.disposing ??= [target];
   const sink = (child) => { queue.push(child); };
   for (let index = 0; index < queue.length; index++) {
     const current = queue[index];
+    if (!current) continue;
+    // adopt unfinished descendants before their owner is cleared or skipped.
+    const pending = current.disposing;
+    if (pending && pending !== queue) {
+      for (const child of pending)
+        if (child && child !== current) queue.push(child);
+      current.disposing = null;
+    }
+    // hooked again since it was queued: it is live, its own flush ends what it left.
+    if (current.anchor) {
+      queue[index] = null;
+      continue;
+    }
     debug.enabled && debug.emit({ type: 'dispose', target: current });
     for (let segment = current.head.next; segment; segment = segment.next) sweepSegment(segment, sink);
     current.head.next = null;
@@ -546,7 +565,9 @@ function disposeTarget(target) {
     current.children.clear();
     current.state = IDLE;
     current.unplaced = false;
+    queue[index] = null;
   }
+  target.disposing = null;
 }
 
 function pruneBuckets(target) {
@@ -602,6 +623,7 @@ function withCause(ev, run) {
 }
 
 function placeTarget(target) {
+  if (target.disposing) disposeTarget(target);
   extractPlaced(target.anchor);
   flushEnds(target.anchor);
   let prevEnd = null;
@@ -619,6 +641,7 @@ function flushTarget(target) {
   const pass = target.pass,
     boundary = target.cursor,
     reshaped = target.unplaced || target.reordered || boundary.next !== null;
+  if (target.disposing) disposeTarget(target);
   extractPlaced(target.anchor);
   flushEnds(target.anchor);
 
