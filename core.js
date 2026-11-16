@@ -50,9 +50,37 @@ export function skip(inst) {
   if (!ref) throw new TypeError('temtie/core: skip() expects a target from mount() or capture()');
   const target = ref.target;
   if (target?.state !== STAGED) return;
-  voidOpened(target);
+  discard(target);
   call(target, 'skip');
   target.state = SEALED;
+}
+
+// a pass dropped before it commits closes the passes it opened, and its moves are undone.
+function discard(target) {
+  voidOpened(target);
+  const moved = [...target.children];
+  // a body the pass displaced is in no target's children, only among the leavers
+  for (let segment = target.head.next; segment; segment = segment.next)
+    for (const binding of segment.bindings)
+      for (const { body } of binding.leavers ?? []) if (body && !body.anchor) moved.push(body);
+  for (const body of moved) restore(body, target);
+}
+
+// a body the pass took from a committed hole goes back. a hole of this target gives up what the pass
+// put there. another target's hole keeps what it holds now.
+function restore(body, target) {
+  const home = body.placedIn, occupant = home?.occupant;
+  if (!home || home === body.anchor || (occupant && body.placedUnder !== target) || beneath(body.placedUnder, body)) return;
+  // init and render already ran. record the occupant so the flush ends it.
+  // a plain occupant was not written.
+  if (occupant?.kind === 'instance' || occupant?.kind === 'body') displace(home);
+  else if (occupant) home.occupant = null;
+  const back = home.leavers?.findLast((occ) => occ.body === body);
+  if (back) home.leavers = home.leavers.filter((occ) => occ !== back);
+  hook(body.placedUnder, body, home);
+  home.occupant = back ?? { kind: 'body', body };
+  body.unplaced = false;
+  debug.enabled && debug.emit({ type: 'claim', binding: home, occupant: home.occupant });
 }
 
 // close descendant passes that started after this one. a pass staged earlier stays open.
@@ -70,7 +98,7 @@ export function reset(inst) {
   if (!ref) throw new TypeError('temtie/core: reset() expects a target from mount() or capture()');
   const target = ref.target;
   if (!target) return;
-  if (target.state === STAGED) voidOpened(target);
+  if (target.state === STAGED) discard(target);
   call(target, 'reset');
 }
 
@@ -114,6 +142,7 @@ function makeTarget(proto, anchor) {
     unplaced: false,
     reordered: false,
     placedIn: null,
+    placedUnder: null, // the target that owns placedIn
     voided: false, // do not append: a voided ancestor, or a commit that has taken this pass
     disposing: null, // bodies left to dispose after a throw
     buckets: new Map(),
@@ -168,8 +197,8 @@ function touch(target) {
     target.state = STAGED;
     return;
   }
-  // a pass started over closes the passes it opened
-  if (target.state === STAGED) voidOpened(target);
+  // a pass started over is dropped
+  if (target.state === STAGED) discard(target);
   call(target);
 }
 
@@ -442,15 +471,19 @@ function resolveInstance(parent, binding, raw, init) {
 
 function hook(parent, child, binding) {
   if (child.anchor === binding) return;
-  for (let cursor = parent; cursor; cursor = cursor.parent)
-    if (cursor === child)
-      throw new Error('temtie/core: a target cannot be anchored beneath its descendant');
+  if (beneath(parent, child))
+    throw new Error('temtie/core: a target cannot be anchored beneath its descendant');
   if (child.anchor) leave(child.anchor, child);
   child.parent?.children.delete(child);
   child.parent = parent;
   child.anchor = binding;
   child.unplaced = true;
   parent.children.add(child);
+}
+
+function beneath(parent, child) {
+  for (let cursor = parent; cursor; cursor = cursor.parent) if (cursor === child) return true;
+  return false;
 }
 
 // drop a moved body occupant. displace a moved instance so release and clear run at flush. do not dispose the body.
@@ -468,13 +501,14 @@ function displace(binding) {
   debug.enabled && debug.emit({ type: 'displace', binding, occupant });
   binding.occupant = null;
   (binding.leavers ??= []).push(occupant);
-  const body = occupant.body;
-  if (body && body.anchor === binding) {
-    body.parent?.children.delete(body);
-    body.parent = null;
-    body.anchor = null;
-    body.unplaced = false;
-  }
+  if (occupant.body?.anchor === binding) unhook(occupant.body);
+}
+
+function unhook(body) {
+  body.parent?.children.delete(body);
+  body.parent = null;
+  body.anchor = null;
+  body.unplaced = false;
 }
 
 function end(binding, occupant, sink) {
@@ -492,7 +526,7 @@ function endBody(body, sink) {
   if (body.anchor) return; // still anchored: do not dispose
   evictChain(body.head.next);
   if (body.placedIn?.placedBody === body) body.placedIn.placedBody = null;
-  body.placedIn = null;
+  body.placedIn = body.placedUnder = null;
   sink(body);
 }
 
@@ -501,7 +535,7 @@ function extractPlaced(binding) {
   const body = binding.placedBody;
   if (!body || body.anchor === binding) return;
   binding.placedBody = null;
-  if (body.placedIn === binding) body.placedIn = null;
+  if (body.placedIn === binding) body.placedIn = body.placedUnder = null;
   evictChain(body.head.next);
 }
 
@@ -510,6 +544,7 @@ function notePlaced(target) {
   if (!binding || binding.dest.kind === ROOT) return;
   if (target.placedIn && target.placedIn !== binding && target.placedIn.placedBody === target) target.placedIn.placedBody = null;
   target.placedIn = binding;
+  target.placedUnder = target.parent;
   binding.placedBody = target;
 }
 
