@@ -27,7 +27,9 @@ export function mount(container, { builders } = {}) {
   if (!builders || typeof builders !== 'object' || !Object.keys(builders).length)
     throw new Error('temtie/core: mount() requires builders, e.g. mount(el, { builders: { html } })');
 
-  const ref = makeRef(makeTarget(makeProto(builders), { dest: DEST[ROOT], node: container }));
+  const anchor = { dest: DEST[ROOT], node: container };
+  const ref = makeRef(makeTarget(makeProto(builders), anchor));
+  ref.target.placedIn = anchor; // the container is home before the first commit
   debug.enabled && debug.emit({ type: 'mount', target: ref.target, container, builders: Object.keys(builders) });
   return ref.inst;
 }
@@ -78,8 +80,10 @@ function restore(body, target) {
   const back = home.leavers?.findLast((occ) => occ.body === body);
   if (back) home.leavers = home.leavers.filter((occ) => occ !== back);
   hook(body.placedUnder, body, home);
-  home.occupant = back ?? { kind: 'body', body };
   body.unplaced = false;
+  // a root's container is not a hole. nothing claims it.
+  if (home.dest.kind === ROOT) return;
+  home.occupant = back ?? { kind: 'body', body };
   debug.enabled && debug.emit({ type: 'claim', binding: home, occupant: home.occupant });
 }
 
@@ -303,8 +307,10 @@ const DEST = {
     container: (anchor) => anchor.node,
     // insert the root marker after the container's existing children. if it is missing, lay it again.
     after(anchor, builder) {
-      if (!anchor.marker || builder.parent(anchor.marker) !== anchor.node)
+      if (!anchor.marker || builder.parent(anchor.marker) !== anchor.node) {
         anchor.marker = lay(anchor, builder);
+        anchor.builder = builder;
+      }
       return anchor.marker;
     },
   },
@@ -423,8 +429,6 @@ function resolveBody(parent, binding, ref, values) {
       // a body displaced and not flushed is still committed. a fresh capture reuses it.
       ?? binding.leavers?.findLast((occ) => occ.kind === 'body' && !occ.body.anchor && !carried(occ.body, values))?.body
       ?? makeTarget(parent.proto, null);
-  if (child.anchor?.dest.kind === ROOT)
-    throw new Error('temtie/core: a mounted root cannot be interpolated into a template');
   if (ref.target !== child) {
     ref.target = child;
     Object.setPrototypeOf(ref.inst, child.proto);
@@ -478,7 +482,8 @@ function hook(parent, child, binding) {
   child.parent = parent;
   child.anchor = binding;
   child.unplaced = true;
-  parent.children.add(child);
+  // a root's container is not a target: restoring it there has no parent
+  parent?.children.add(child);
 }
 
 function beneath(parent, child) {
@@ -541,8 +546,16 @@ function extractPlaced(binding) {
 
 function notePlaced(target) {
   const binding = target.anchor;
-  if (!binding || binding.dest.kind === ROOT) return;
-  if (target.placedIn && target.placedIn !== binding && target.placedIn.placedBody === target) target.placedIn.placedBody = null;
+  if (!binding) return;
+  const old = target.placedIn;
+  if (old && old !== binding) {
+    if (old.placedBody === target) old.placedBody = null;
+    // a root placed in a hole has left its container. its marker goes with it.
+    if (old.dest.kind === ROOT && old.marker) {
+      old.builder.remove(old.marker, old.marker);
+      old.marker = null;
+    }
+  }
   target.placedIn = binding;
   target.placedUnder = target.parent;
   binding.placedBody = target;
