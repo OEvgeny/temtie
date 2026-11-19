@@ -1,20 +1,26 @@
 /* ꙋ temtie · builder · dom.js */
-/** @import { Builder } from '../types.d.ts' */
+/** @import { Builder, TemplateBuilder } from '../types.d.ts' */
 
 import { compileTemplate } from '../parser.js';
 
 const SVG_NAMESPACE = 'http://www.w3.org/2000/svg';
 const TEMTIE_PROP_NAMES = Symbol.for('temtie.propNames');
 // marks a text node setChild made from a value: only such a node is its to
-// rewrite in place. toNode() output is the caller's once handed back
+// rewrite in place. an adopted Text node is the caller's
 const OWN_TEXT = Symbol('temtie.ownText');
+const OWNED = Symbol('temtie.owned');
 
 function isDomNode(value) {
   return !!value && typeof value === 'object' && typeof value.nodeType === 'number';
 }
 
-function isIterable(value) {
-  return value != null && typeof value !== 'string' && typeof value[Symbol.iterator] === 'function';
+function toNodes(builder, value) {
+  if (value == null || value === false) return [];
+  if (isDomNode(value))
+    return value.nodeType === 11 ? Array.from(value.childNodes) : [value];
+  if (typeof value !== 'string' && typeof value[Symbol.iterator] === 'function')
+    return Array.from(value, (item) => toNodes(builder, item)).flat();
+  return [builder.createText(String(value))];
 }
 
 const isHandler = (name, value) => typeof name === 'string' && name.startsWith('on') && typeof value === 'function';
@@ -23,7 +29,10 @@ function shouldSetProperty(node, name, value) {
   return typeof name === 'symbol' || isHandler(name, value) || node?.[TEMTIE_PROP_NAMES]?.has(name);
 }
 
-/** @implements {Builder<Node, Node[], DocumentFragment>} */
+/**
+ * @implements {Builder<Node, DocumentFragment>}
+ * @implements {TemplateBuilder<Node, DocumentFragment>}
+ */
 export class DOMBuilder {
   #decoder = null;
 
@@ -95,13 +104,6 @@ export class DOMBuilder {
     return node;
   }
 
-  isContainer(node) {
-    return !!node && (
-      node.nodeType === 1 ||
-      node.nodeType === 11
-    );
-  }
-
   firstChild(container) {
     return container.firstChild;
   }
@@ -114,19 +116,9 @@ export class DOMBuilder {
     return node.parentNode ?? null;
   }
 
-  contains(container, node) {
-    return typeof container?.contains === 'function'
-      ? container.contains(node)
-      : false;
-  }
-
   insert(parent, content, after = null) {
-    if (Array.isArray(content)) {
-      const fragment = this.document.createDocumentFragment();
-      fragment.append(...content);
-      content = fragment;
-    }
-
+    if (after != null && after.parentNode !== parent)
+      throw new Error('temtie/builder/dom: insert anchor must belong to its container');
     parent.insertBefore(content, after?.nextSibling ?? null);
   }
 
@@ -139,8 +131,7 @@ export class DOMBuilder {
     const range = (start.ownerDocument ?? this.document).createRange();
     range.setStartBefore(start);
     range.setEndAfter(end);
-    const fragment = range.extractContents();
-    return Array.from(fragment.childNodes);
+    return range.extractContents();
   }
 
   remove(start, end) {
@@ -155,10 +146,6 @@ export class DOMBuilder {
     range.deleteContents();
   }
 
-  next(node) {
-    return node.nextSibling ?? null;
-  }
-
   prev(node) {
     return node.previousSibling ?? null;
   }
@@ -167,63 +154,36 @@ export class DOMBuilder {
     return this.constructor.voidElements.has(tag.toLowerCase());
   }
 
-  collectRange(start, end) {
-    if (!isDomNode(start) || !isDomNode(end))
-      throw new Error('temtie/builder/dom: range boundaries must be DOM nodes');
-
-    if (start === end) return [start];
-
-    const startParent = start.parentNode ?? null,
-      endParent = end.parentNode ?? null;
-
-    if (startParent !== endParent)
-      throw new Error('temtie/builder/dom: invalid range handle: boundary nodes are not siblings');
-
-    const nodes = [];
-    let node = start;
-
-    while (node) {
-      nodes.push(node);
-      if (node === end) return nodes;
-      node = node.nextSibling;
-    }
-
-    throw new Error('temtie/builder/dom: invalid range handle: end boundary is unreachable from start');
-  }
-
-  toNodes(value) {
-    if (value == null || value === false) return [];
-    if (isDomNode(value))
-      return value.nodeType === 11 ? Array.from(value.childNodes) : [value];
-    if (Array.isArray(value))
-      return value.flatMap(this.toNodes, this);
-    if (isIterable(value))
-      return Array.from(value).flatMap(this.toNodes, this);
-    return [this.createText(String(value))];
-  }
-
-  toNode(...values) {
-    const nodes = values.flatMap(this.toNodes, this);
-    if (nodes.length === 1) return nodes[0];
-    return nodes;
-  }
-
   // the marker anchors the range and survives every replacement
   setChild(marker, after, value) {
     const parent = marker.parentNode;
     if (!parent) return after;
 
     const first = after === marker ? null : marker.nextSibling,
+      ranges = marker[OWNED],
       text = typeof value === 'string' || typeof value === 'number';
-    if (text && first === after && first?.[OWN_TEXT]) {
+    if (text && first === after && first?.[OWN_TEXT] && !ranges?.has(after)) {
       first.data = String(value);
       return first;
     }
 
-    const next = this.toNodes(value);
+    const next = toNodes(this, value);
     if (text) next[0][OWN_TEXT] = true;
 
-    if (first) this.remove(first, after);
+    if (after !== marker) {
+      const owned = ranges?.get(after);
+      if (owned) {
+        if (owned.has(first)) {
+          let end = first;
+          while (owned.has(end.nextSibling)) end = end.nextSibling;
+          this.remove(first, end);
+        }
+        ranges.delete(after);
+        if (!ranges.size) marker[OWNED] = null;
+      } else if (first === after && first) {
+        this.remove(after, after);
+      }
+    }
 
     const before = marker.nextSibling;
     let tail = marker;
@@ -231,6 +191,7 @@ export class DOMBuilder {
       parent.insertBefore(node, before);
       tail = node;
     }
+    if (next.length > 1) (marker[OWNED] ??= new Map()).set(tail, new Set(next));
     return tail;
   }
 }

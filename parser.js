@@ -1,9 +1,12 @@
 /* ꙋ temtie · parser.js */
-/** @import { Builder, Template, Hole } from './types.d.ts' */
+/** @import { TemplateBuilder, Template } from './types.d.ts' */
 
-import { TEMPLATE_HOLE_TYPES } from './core.js';
-
-export { TEMPLATE_HOLE_TYPES };
+export const TEMPLATE_HOLE_TYPES = {
+  CHILD: 'child',
+  ATTR: 'attr',
+  SPREAD: 'spread',
+  META: 'meta',
+};
 
 // where the scan stands when a static ends. only TEXT and IN_TAG carry over
 // a hole; every other mode there is a hole kind or a syntax error
@@ -36,20 +39,15 @@ function isNameStart(c) {
   return (c < 48 || c > 57) && isNameChar(c);
 }
 
-// names under # belong to the core. #key is the only resident, and it
-// exists only as a meta hole — nothing in the namespace may reach the
-// medium, statically or through a prop hole
-function assertCoreName(name, meta) {
+// names under # belong to the core. #key is the only resident, and it is
+// consumed at compile time — nothing in the namespace may reach the medium
+function assertCoreName(name) {
   if (name[0] !== '#') return;
 
-  if (!meta)
-    throw new SyntaxError(
-      name === '#key'
-        ? `${ERROR}#key takes an interpolated value: #key\${value}`
-        : `${ERROR}unknown reserved prop "${name}"`);
-
-  if (name !== '#key')
-    throw new SyntaxError(`${ERROR}unknown reserved meta-prop "${name}"`);
+  throw new SyntaxError(
+    name === '#key'
+      ? `${ERROR}#key takes an interpolated value: #key\${value}`
+      : `${ERROR}unknown reserved prop "${name}"`);
 }
 
 function spreadWithoutHole() {
@@ -59,6 +57,7 @@ function spreadWithoutHole() {
 function parseTemplate(strings, builder) {
   const fragment = builder.createRoot(),
     holes = [],
+    paths = [],
     decodeStatic = builder.decodeStatic?.bind(builder) ?? (value => value),
     isVoidElement = builder.isVoidElement?.bind(builder) ?? (() => false),
     stack = [{ node: fragment, path: [], childIndex: 0, tag: null }];
@@ -68,7 +67,7 @@ function parseTemplate(strings, builder) {
     pendingPath = null,
     pendingTag = '',
     attrNames = null,
-    metaNames = null,
+    keySlot = -1,
     lastHoleMarker = null;
 
   function insertText(text) {
@@ -81,7 +80,6 @@ function parseTemplate(strings, builder) {
     pendingPath = [...ctx.path, ctx.childIndex];
     pendingTag = tag;
     attrNames = [];
-    metaNames = [];
   }
 
   function placeTag(opens) {
@@ -95,16 +93,16 @@ function parseTemplate(strings, builder) {
     placeTag(!isVoidElement(pendingTag));
   }
 
-  function claimName(names, name, kind) {
-    if (names.includes(name))
-      throw new SyntaxError(`${ERROR}duplicate ${kind} "${name}" in <${pendingTag}>`);
+  function claimAttr(name) {
+    if (attrNames.includes(name))
+      throw new SyntaxError(`${ERROR}duplicate attribute "${name}" in <${pendingTag}>`);
 
-    names.push(name);
+    attrNames.push(name);
   }
 
   function setStaticProp(name, value) {
-    assertCoreName(name, false);
-    claimName(attrNames, name, 'attribute');
+    assertCoreName(name);
+    claimAttr(name);
     if (value === true) builder.setProp(pending, name, true);
     else builder.setProp(pending, name, decodeStatic(value, 'attr'), value);
   }
@@ -386,7 +384,8 @@ function parseTemplate(strings, builder) {
         // lands after, referenced only while the hole has no content to speak for it
         const marker = builder.createMarker();
         builder.insert(ctx.node, marker);
-        holes.push({ type: TEMPLATE_HOLE_TYPES.CHILD, slot: i, path: [...ctx.path, ctx.childIndex] });
+        holes.push({ type: TEMPLATE_HOLE_TYPES.CHILD, slot: i });
+        paths.push([...ctx.path, ctx.childIndex]);
         if (ctx.node === fragment) lastHoleMarker = marker;
         ctx.childIndex++;
         break;
@@ -394,7 +393,8 @@ function parseTemplate(strings, builder) {
 
       case IN_TAG:
         if (spreadDots === 3) {
-          holes.push({ type: TEMPLATE_HOLE_TYPES.SPREAD, slot: i, path: pendingPath });
+          holes.push({ type: TEMPLATE_HOLE_TYPES.SPREAD, slot: i });
+          paths.push(pendingPath);
           spreadDots = 0;
           break;
         }
@@ -405,9 +405,10 @@ function parseTemplate(strings, builder) {
         throw new SyntaxError(`${ERROR}bare interpolation inside a tag is not supported`);
 
       case ATTR_EQ:
-        assertCoreName(attrName, false);
-        claimName(attrNames, attrName, 'attribute');
-        holes.push({ type: TEMPLATE_HOLE_TYPES.ATTR, slot: i, path: pendingPath, prop: attrName });
+        assertCoreName(attrName);
+        claimAttr(attrName);
+        holes.push({ type: TEMPLATE_HOLE_TYPES.ATTR, slot: i, prop: attrName });
+        paths.push(pendingPath);
         mode = IN_TAG;
         break;
 
@@ -416,9 +417,13 @@ function parseTemplate(strings, builder) {
         const next = strings[i + 1];
         if (attrName[0] !== '#' || (next.length && !isSpace(next.charCodeAt(0)) && next[0] !== '>' && next[0] !== '/'))
           throw new SyntaxError(`${ERROR}interpolation is not allowed inside attribute name "${attrName}"`);
-        assertCoreName(attrName, true);
-        claimName(metaNames, attrName, 'metadata');
-        holes.push({ type: TEMPLATE_HOLE_TYPES.META, slot: i, path: pendingPath, name: attrName });
+        if (attrName !== '#key')
+          throw new SyntaxError(`${ERROR}unknown reserved meta-prop "${attrName}"`);
+        if (pendingPath.length !== 1)
+          throw new SyntaxError(`${ERROR}#key belongs on a root element of the template`);
+        if (keySlot !== -1)
+          throw new SyntaxError(`${ERROR}a template takes a single #key`);
+        keySlot = i;
         mode = IN_TAG;
         break;
       }
@@ -476,41 +481,17 @@ function parseTemplate(strings, builder) {
       throw new SyntaxError(`${ERROR}malformed self-closing tag`);
   }
 
-  // hole content lands after its marker, so a template ending in a
-  // top-level hole gets a pin: the fragment's last node must stay physical
-  // for segment ranges to hold
-  if (lastHoleMarker && builder.lastChild(fragment) === lastHoleMarker)
+  // a segment needs physical boundaries: an empty template gets a marker, and
+  // a template ending in a top-level hole gets a trailing pin
+  const tail = builder.lastChild(fragment);
+  if (!tail || tail === lastHoleMarker)
     builder.insert(fragment, builder.createMarker());
 
-  return { fragment, holes };
+  return { fragment, holes, paths, keySlot };
 }
 
 /**
- * @param {readonly Hole[]} holes
- * @returns {number}
- */
-function deriveKeySlot(holes) {
-  let slot = -1;
-
-  for (const hole of holes) {
-    if (hole.type !== TEMPLATE_HOLE_TYPES.META || hole.name !== '#key') continue;
-
-    // a reserved name is never silently dead: #key either keys the segment
-    // or refuses to compile
-    if (!Array.isArray(hole.path) || hole.path.length !== 1)
-      throw new SyntaxError(`${ERROR}#key belongs on a root element of the template`);
-
-    if (slot !== -1)
-      throw new SyntaxError(`${ERROR}a template takes a single #key`);
-
-    slot = hole.slot;
-  }
-
-  return slot;
-}
-
-/**
- * @template {Builder} B
+ * @template {TemplateBuilder} B
  * @param {TemplateStringsArray} strings
  * @param {B} builder
  * @returns {Template<B>}
@@ -522,14 +503,21 @@ export function compileTemplate(strings, builder) {
   if (!strings || (typeof strings !== 'object' && typeof strings !== 'function'))
     throw new TypeError('temtie/parser: compileTemplate requires a template strings object');
 
-  const { fragment, holes } = parseTemplate(strings, builder),
-    template = {
-      site: strings,
-      builder,
-      fragment,
-      holes,
-      keySlot: deriveKeySlot(holes),
-    };
+  const { fragment, holes, paths, keySlot } = parseTemplate(strings, builder);
 
-  return template;
+  return {
+    site: strings,
+    builder,
+    holes,
+    keySlot,
+    instantiate() {
+      const content = builder.clone(fragment);
+      return {
+        content,
+        start: builder.firstChild(content),
+        end: builder.lastChild(content),
+        nodes: paths.map((path) => builder.resolve(content, path)),
+      };
+    },
+  };
 }

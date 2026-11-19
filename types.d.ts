@@ -3,57 +3,70 @@
 export type PropertyKeyLike = string | number | symbol;
 
 /* Builder contract */
-export interface Builder<Node = unknown, NodeCollection = unknown[], Root = Node> {
-  compile(strings: TemplateStringsArray): Template<Builder<Node, NodeCollection, Root>>;
+export interface Builder<Node = unknown, Root = Node> {
+  compile(strings: TemplateStringsArray): Template<Builder<Node, Root>>;
   createRoot(): Root;
-  decodeStatic?(value: string, context?: 'text' | 'attr'): string;
-  isVoidElement?(tag: string): boolean;
-  createElement(tag: string, parent?: Node): Node;
-  createText(text: string, source?: string): Node;
   createMarker(): Node;
+  parent(node: Node): Node | Root | null;
+  prev(node: Node): Node | null;
+  /**
+   * Adopt the node or all fragment children after `after`; null appends.
+   * A throw must leave source ownership and destination contents unchanged.
+   */
+  insert(parent: Node | Root, content: Node | Root, after?: Node | null): void;
+  extract(start: Node, end: Node): Node | Root;
+  remove(start: Node, end: Node): void;
+  setChild(marker: Node, after: Node, value: Renderable): Node;
   setProp(node: Node, name: PropertyKeyLike, value: unknown, source?: string): void;
   unsetProp(node: Node, name: PropertyKeyLike): void;
-  clone(root: Root): Root;
-  resolve(root: Root, path: readonly number[]): Node;
-  isContainer(node: unknown): node is Node | Root;
+}
+
+/* Template builder */
+export interface TemplateBuilder<Node = unknown, Root = Node>
+  extends Pick<Builder<Node, Root>, 'createRoot' | 'createMarker' | 'setProp' | 'insert'> {
+  createElement(tag: string, parent?: Node | Root): Node;
+  createText(text: string, source?: string): Node;
   firstChild(container: Node | Root): Node | null;
   lastChild(container: Node | Root): Node | null;
-  parent(node: Node): Node | Root | null;
-  contains(container: Node | Root, node: Node): boolean;
-  insert(parent: Node | Root, content: Node | NodeCollection, after?: Node | null): void;
-  extract(start: Node, end: Node): Node | NodeCollection;
-  remove(start: Node, end: Node): void;
-  next(node: Node): Node | null;
-  prev(node: Node): Node | null;
-  setChild(marker: Node, after: Node, value: Renderable): Node;
-  toNode(...values: Renderable[]): Node | NodeCollection;
-  toNodes(value: Renderable): NodeCollection;
-  collectRange(start: Node, end: Node): NodeCollection;
+  clone(root: Root): Root;
+  resolve(root: Root, path: readonly number[]): Node;
+  decodeStatic?(value: string, context?: 'text' | 'attr'): string;
+  isVoidElement?(tag: string): boolean;
 }
 
 export type Builders = object;
 export type BuilderKeys<Bs extends Builders> = {
-  [Name in keyof Bs]: Bs[Name] extends Builder<any, any, any> ? Name : never;
+  [Name in keyof Bs]: Bs[Name] extends Builder<any, any> ? Name : never;
 }[keyof Bs];
-export type AnyBuilderOf<Bs extends Builders> = Extract<Bs[BuilderKeys<Bs>], Builder<any, any, any>>;
-export type BuilderNode<B> = B extends Builder<infer Node, any, any> ? Node : never;
-export type BuilderRoot<B> = B extends Builder<any, any, infer Root> ? Root : never;
+export type AnyBuilderOf<Bs extends Builders> = Extract<Bs[BuilderKeys<Bs>], Builder<any, any>>;
+export type BuilderNode<B> =
+  B extends Builder<infer Node, any> ? Node :
+  B extends TemplateBuilder<infer Node, any> ? Node :
+  unknown;
+export type BuilderRoot<B> = B extends { createRoot(): infer Root } ? Root : unknown;
 export type RenderContainer<Bs extends Builders> =
   BuilderNode<AnyBuilderOf<Bs>> | BuilderRoot<AnyBuilderOf<Bs>>;
 
-export interface Template<B extends Builder<any, any, any> = Builder> {
+export interface TemplateInstance<Node = unknown, Root = Node> {
+  readonly content: Node | Root;
+  readonly start: Node;
+  readonly end: Node;
+  readonly nodes: readonly Node[];
+}
+
+export interface Template<B = Builder> {
   readonly site: TemplateStringsArray;
   readonly builder: B;
-  readonly fragment: BuilderRoot<B>;
   readonly holes: readonly Hole[];
   readonly keySlot: number;
+  instantiate(): TemplateInstance<BuilderNode<B>, BuilderRoot<B>>;
 }
 
 export type Hole =
-  | { readonly type: 'child'; readonly slot: number; readonly path: readonly number[] }
-  | { readonly type: 'attr'; readonly slot: number; readonly path: readonly number[]; readonly prop: PropertyKeyLike }
-  | { readonly type: 'spread'; readonly slot: number; readonly path: readonly number[] }
-  | { readonly type: 'meta'; readonly slot: number; readonly path: readonly number[]; readonly name: PropertyKeyLike };
+  | { readonly type: 'child'; readonly slot: number }
+  | { readonly type: 'attr'; readonly slot: number; readonly prop: PropertyKeyLike }
+  | { readonly type: 'spread'; readonly slot: number }
+  | { readonly type: 'meta'; readonly slot: number; readonly name: PropertyKeyLike };
 
 /* Core runtime */
 export type Renderable =
@@ -88,7 +101,7 @@ export type Commit = (instance: Instance<any>) => void;
 export type Skip = (instance: Instance<any>) => void;
 export type Reset = (instance: Instance<any>) => void;
 
-export function compileTemplate<B extends Builder<any, any, any>>(
+export function compileTemplate<B extends TemplateBuilder<any, any>>(
   strings: TemplateStringsArray,
   builder: B
 ): Template<B>;
@@ -166,8 +179,8 @@ export interface DebugHub {
 
 /* Default builder set */
 export interface DefaultBuilders {
-  html: Builder<Node, Node[], DocumentFragment>;
-  svg: Builder<Node, Node[], DocumentFragment>;
+  html: Builder<Node, DocumentFragment>;
+  svg: Builder<Node, DocumentFragment>;
 }
 
 declare module 'temtie/core.js' {
@@ -176,6 +189,16 @@ declare module 'temtie/core.js' {
   export const commit: Commit;
   export const skip: Skip;
   export const reset: Reset;
+  export const TEMPLATE_HOLE_TYPES: {
+    readonly CHILD: 'child';
+    readonly ATTR: 'attr';
+    readonly SPREAD: 'spread';
+    readonly META: 'meta';
+  };
+}
+
+declare module 'temtie/parser.js' {
+  export { compileTemplate };
   export const TEMPLATE_HOLE_TYPES: {
     readonly CHILD: 'child';
     readonly ATTR: 'attr';
@@ -195,7 +218,7 @@ declare module 'temtie/builder/dom.js' {
     constructor(document?: Document);
     readonly document: Document;
   }
-  export interface DOMBuilder extends Builder<Node, Node[], DocumentFragment> {}
+  export interface DOMBuilder extends Builder<Node, DocumentFragment>, TemplateBuilder<Node, DocumentFragment> {}
 
   export class SVGBuilder extends DOMBuilder {}
 
@@ -208,7 +231,7 @@ declare module 'temtie/builder/markup.js' {
     static voidElements: Set<string>;
     serialize(node: object): string;
   }
-  export interface MarkupBuilder extends Builder<object, object[], object> {}
+  export interface MarkupBuilder extends Builder<object, object>, TemplateBuilder<object, object> {}
 
   export const markup: MarkupBuilder;
   // reads the default builder's committed tree into a markup string: every

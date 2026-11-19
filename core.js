@@ -167,8 +167,8 @@ function compile(builder, strings, target) {
     site: strings, html: strings.join('${...}').slice(0, 100),
   });
   const template = builder.compile(strings);
-  if (!template?.fragment || !Array.isArray(template.holes))
-    throw new TypeError('temtie/core: builder.compile() must return a template { fragment, holes, keySlot }');
+  if (typeof template?.instantiate !== 'function' || !Array.isArray(template.holes))
+    throw new TypeError('temtie/core: builder.compile() must return a template { instantiate, holes, keySlot }');
   template.builder ??= builder;
   template.keySlot ??= -1;
   const site = { template };
@@ -234,23 +234,14 @@ function takeSegment(target, site, values) {
 function makeSegment(site) {
   const template = site.template,
     builder = template.builder,
-    fragment = builder.clone(template.fragment);
-
-  let start = builder.firstChild(fragment), end = builder.lastChild(fragment);
-  if (!start) {
-    const marker = builder.createMarker();
-    builder.insert(fragment, marker);
-    start = end = marker;
-  }
-
-  const bindings = template.holes.map((hole) => makeBinding(builder, fragment, hole));
-  return { template, builder, start, end, bindings, values: [], prev: null, next: null, pass: 0, parked: null, sunk: false, clean: false };
+    { content, start, end, nodes } = template.instantiate(),
+    bindings = template.holes.map((hole, index) => makeBinding(builder, hole, nodes[index]));
+  return { template, builder, start, end, bindings, values: [], prev: null, next: null, pass: 0, parked: content, sunk: false, clean: false };
 }
 
 // the child marker stays. content is the nodes after it.
-function makeBinding(builder, fragment, hole) {
-  const dest = DEST[hole.type],
-    node = builder.resolve(fragment, hole.path);
+function makeBinding(builder, hole, node) {
+  const dest = DEST[hole.type];
   return {
     dest,
     slot: hole.slot,
@@ -324,7 +315,7 @@ const DEST = {
       occupant.after = binding.builder.setChild(binding.marker, occupant.after, value);
     },
     clear(binding, occupant) {
-      if (occupant.after)
+      if (occupant.after && occupant.after !== binding.marker)
         occupant.after = binding.builder.setChild(binding.marker, occupant.after, null);
     }
   },
@@ -375,7 +366,7 @@ function lay(anchor, builder) {
 
 function resolveSegment(target, segment, values) {
   segment.values = values;
-  let clean = true;
+  let clean = !segment.parked;
   for (const binding of segment.bindings) {
     const raw = values[binding.slot];
     if (raw !== null && (typeof raw === 'object' || typeof raw === 'function')) {
@@ -387,7 +378,7 @@ function resolveSegment(target, segment, values) {
       }
       if (raw[PRIVATE]) {
         clean = false;
-        resolveBody(target, binding, raw[PRIVATE], values);
+        resolveBody(target, segment, binding, raw[PRIVATE]);
         continue;
       }
     }
@@ -413,10 +404,11 @@ function resolvePlain(binding) {
   debug.enabled && debug.emit({ type: 'claim', binding, occupant: binding.occupant });
 }
 
-// a fresh capture does not take a body that another value of the same call carries elsewhere.
-const carried = (body, values) => values.some((value) => value?.[PRIVATE]?.target === body);
+// a fresh capture does not take a body that another hole of the same call carries elsewhere.
+const carried = (body, segment) =>
+  segment.bindings.some((binding) => segment.values[binding.slot]?.[PRIVATE]?.target === body);
 
-function resolveBody(parent, binding, ref, values) {
+function resolveBody(parent, segment, binding, ref) {
   // meta has no marker. a target cannot anchor there. an instance body can.
   if (binding.dest.instanceOnly)
     throw new Error('temtie/core: a meta hole cannot host a target');
@@ -425,9 +417,9 @@ function resolveBody(parent, binding, ref, values) {
 
   const occupant = binding.occupant,
     child = ref.target
-      ?? (occupant?.kind === 'body' && !carried(occupant.body, values) ? occupant.body : null)
+      ?? (occupant?.kind === 'body' && !carried(occupant.body, segment) ? occupant.body : null)
       // a body displaced and not flushed is still committed. a fresh capture reuses it.
-      ?? binding.leavers?.findLast((occ) => occ.kind === 'body' && !occ.body.anchor && !carried(occ.body, values))?.body
+      ?? binding.leavers?.findLast((occ) => occ.kind === 'body' && !occ.body.anchor && !carried(occ.body, segment))?.body
       ?? makeTarget(parent.proto, null);
   if (ref.target !== child) {
     ref.target = child;
@@ -552,7 +544,7 @@ function notePlaced(target) {
     if (old.placedBody === target) old.placedBody = null;
     // a root placed in a hole has left its container. its marker goes with it.
     if (old.dest.kind === ROOT && old.marker) {
-      old.builder.remove(old.marker, old.marker);
+      if (old.builder.parent(old.marker)) old.builder.remove(old.marker, old.marker);
       old.marker = null;
     }
   }
@@ -568,7 +560,7 @@ function evictChain(segment) {
 function park(segment) {
   // extract a placed body that has left before extracting this range.
   for (const binding of segment.bindings) extractPlaced(binding);
-  if (segment.builder.parent(segment.start))
+  if (!segment.parked && segment.builder.parent(segment.start))
     segment.parked = segment.builder.extract(segment.start, segment.end);
 }
 
@@ -706,7 +698,7 @@ function flushTarget(target) {
   for (let segment = boundary.next; segment; segment = segment.next) {
     debug.enabled && debug.emit({ type: 'drop', target, segment });
     sweepSegment(segment, disposeTarget);
-    if (segment.builder.parent(segment.start)) segment.builder.extract(segment.start, segment.end);
+    if (!segment.parked && segment.builder.parent(segment.start)) segment.builder.remove(segment.start, segment.end);
   }
   boundary.next = null;
 
