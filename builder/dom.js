@@ -25,25 +25,45 @@ function toNodes(builder, value) {
 
 const isHandler = (name, value) => typeof name === 'string' && name.startsWith('on') && typeof value === 'function';
 
+const asText = (value) => value ?? '';
+const FORM_PROPS = new Map([
+  ['input', new Map([['value', asText], ['checked', Boolean], ['indeterminate', Boolean]])],
+  ['textarea', new Map([['value', asText]])],
+  ['select', new Map([['value', asText], ['selectedIndex', (value) => value ?? -1]])],
+  ['option', new Map([['selected', Boolean]])],
+]);
+
 function shouldSetProperty(node, name, value) {
-  return typeof name === 'symbol' || isHandler(name, value) || node?.[TEMTIE_PROP_NAMES]?.has(name);
+  return typeof name === 'symbol'
+    || isHandler(name, value)
+    || isDomNode(value)
+    || node?.[TEMTIE_PROP_NAMES]?.has(name);
 }
 
-/**
- * @implements {Builder<Node, DocumentFragment>}
- * @implements {TemplateBuilder<Node, DocumentFragment>}
- */
-export class DOMBuilder {
+function writeProp(node, name, value) {
+  if (shouldSetProperty(node, name, value)) {
+    node[name] = value ?? null;
+    return;
+  }
+
+  // a handler or node the name held gives way to the attribute
+  if (isHandler(name, node[name]) || isDomNode(node[name])) node[name] = null;
+  DOMTemplateBuilder.prototype.setProp(node, name, value);
+}
+
+/** @implements {TemplateBuilder<Node, DocumentFragment>} */
+class DOMTemplateBuilder {
   #decoder = null;
+  #owner;
 
   static voidElements = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
 
-  constructor(document = globalThis.document) {
-    this.document = document;
+  constructor(owner) {
+    this.#owner = owner ?? this;
   }
 
-  compile(strings) {
-    return compileTemplate(strings, this);
+  get document() {
+    return this.#owner.document;
   }
 
   createRoot() {
@@ -52,9 +72,10 @@ export class DOMBuilder {
 
   decodeStatic(value) {
     if (!value.includes('&')) return value;
-    const textarea = this.#decoder ??= this.document.createElement('textarea');
-    textarea.innerHTML = value;
-    return textarea.value;
+    if (this.#decoder?.ownerDocument !== this.document)
+      this.#decoder = this.document.createElement('textarea');
+    this.#decoder.innerHTML = value;
+    return this.#decoder.value;
   }
 
   // <svg> opens the SVG namespace and its descendants inherit it; the children
@@ -73,25 +94,14 @@ export class DOMBuilder {
     return this.document.createComment('');
   }
 
+  // static template attributes stay on attributes so cloneNode(true) preserves them
   setProp(node, name, value) {
-    if (shouldSetProperty(node, name, value)) {
-      node[name] = value ?? null;
-      return;
-    }
-
-    // a handler the name held gives way to the attribute
-    if (isHandler(name, node[name])) node[name] = null;
     if (value === true)
       node.setAttribute(name, '');
     else if (value === false || value == null)
       node.removeAttribute(name);
     else
       node.setAttribute(name, String(value));
-  }
-
-  unsetProp(node, name) {
-    if (shouldSetProperty(node, name, node[name])) node[name] = null;
-    if (typeof name === 'string') node.removeAttribute(name);
   }
 
   clone(root) {
@@ -112,14 +122,57 @@ export class DOMBuilder {
     return container.lastChild;
   }
 
-  parent(node) {
-    return node.parentNode ?? null;
-  }
-
   insert(parent, content, after = null) {
     if (after != null && after.parentNode !== parent)
       throw new Error('temtie/builder/dom: insert anchor must belong to its container');
     parent.insertBefore(content, after?.nextSibling ?? null);
+  }
+
+  isVoidElement(tag) {
+    return this.#owner.constructor.voidElements.has(tag.toLowerCase());
+  }
+}
+
+class SVGTemplateBuilder extends DOMTemplateBuilder {
+  createElement(tag) {
+    return this.document.createElementNS(SVG_NAMESPACE, tag);
+  }
+}
+
+/**
+ * @implements {Builder<Node, DocumentFragment>}
+ * @implements {TemplateBuilder<Node, DocumentFragment>}
+ */
+export class DOMBuilder extends DOMTemplateBuilder {
+  static TemplateBuilder = DOMTemplateBuilder;
+  document;
+  #templateBuilder;
+
+  constructor(document = globalThis.document) {
+    super();
+    this.document = document;
+    this.#templateBuilder = new this.constructor.TemplateBuilder(this);
+  }
+
+  compile(strings) {
+    return { ...compileTemplate(strings, this.#templateBuilder), builder: this };
+  }
+
+  setProp(node, name, value) {
+    const coerce = FORM_PROPS.get(node?.localName)?.get(name);
+    if (coerce) node[name] = coerce(value);
+    else writeProp(node, name, value);
+  }
+
+  unsetProp(node, name) {
+    const coerce = FORM_PROPS.get(node?.localName)?.get(name);
+    if (coerce) node[name] = coerce(null);
+    else if (shouldSetProperty(node, name, node[name])) node[name] = null;
+    if (typeof name === 'string') node.removeAttribute(name);
+  }
+
+  parent(node) {
+    return node.parentNode ?? null;
   }
 
   extract(start, end) {
@@ -148,10 +201,6 @@ export class DOMBuilder {
 
   prev(node) {
     return node.previousSibling ?? null;
-  }
-
-  isVoidElement(tag) {
-    return this.constructor.voidElements.has(tag.toLowerCase());
   }
 
   // the marker anchors the range and survives every replacement
@@ -197,10 +246,20 @@ export class DOMBuilder {
 }
 
 export class SVGBuilder extends DOMBuilder {
+  static TemplateBuilder = SVGTemplateBuilder;
   static voidElements = new Set();
 
   createElement(tag) {
     return this.document.createElementNS(SVG_NAMESPACE, tag);
+  }
+
+  setProp(node, name, value) {
+    writeProp(node, name, value);
+  }
+
+  unsetProp(node, name) {
+    if (shouldSetProperty(node, name, node[name])) node[name] = null;
+    if (typeof name === 'string') node.removeAttribute(name);
   }
 }
 

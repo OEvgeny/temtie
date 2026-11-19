@@ -215,6 +215,7 @@ declare module 'temtie/debug.js' {
 declare module 'temtie/builder/dom.js' {
   export class DOMBuilder {
     static voidElements: Set<string>;
+    static TemplateBuilder: new (owner: DOMBuilder) => TemplateBuilder<Node, DocumentFragment>;
     constructor(document?: Document);
     readonly document: Document;
   }
