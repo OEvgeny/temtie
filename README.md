@@ -270,9 +270,9 @@ Voids the target's currently staged pass. Committed output stands.
 
 Stages an empty pass. The next commit clears the target.
 
-The typed surface in `types.d.ts` also covers the `Builder` contract, the
-debug hub, and the template compiler (`compileTemplate`, `parseTemplate`,
-`clearTemplateCache` from `parser.js`).
+The typed surface in `types.d.ts` also covers the `Builder` and `TemplateBuilder`
+contracts, the debug hub, and the template compiler (`compileTemplate` from
+`parser.js`).
 
 ## License
 
