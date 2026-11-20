@@ -24,31 +24,44 @@ function toNodes(builder, value) {
 }
 
 const isHandler = (name, value) => typeof name === 'string' && name.startsWith('on') && typeof value === 'function';
+const isDirectProp = (node, name) => typeof name === 'symbol' || !!node?.[TEMTIE_PROP_NAMES]?.has(name);
 
 const asText = (value) => (value == null ? '' : String(value));
 const FORM_PROPS = new Map([
   ['input', new Map([['value', asText], ['checked', Boolean], ['indeterminate', Boolean]])],
   ['textarea', new Map([['value', asText]])],
-  ['select', new Map([['value', asText], ['selectedIndex', (value) => (value == null ? -1 : Number(value))]])],
   ['option', new Map([['selected', Boolean]])],
 ]);
 
-function shouldSetProperty(node, name, value) {
-  return typeof name === 'symbol'
-    || isHandler(name, value)
-    || isDomNode(value)
-    || node?.[TEMTIE_PROP_NAMES]?.has(name);
+function canWriteProp(node, name) {
+  for (let obj = node; obj; obj = Object.getPrototypeOf(obj)) {
+    const desc = Object.getOwnPropertyDescriptor(obj, name);
+    if (desc) return desc.set ? true : !!desc.writable && (obj === node || Object.isExtensible(node));
+  }
+  return Object.isExtensible(node);
+}
+
+function clearDynamicProp(node, name) {
+  if (!(name in node) || !canWriteProp(node, name)) return;
+  const cur = node[name];
+  if (isHandler(name, cur) || isDomNode(cur)) node[name] = null;
 }
 
 function writeProp(node, name, value) {
-  if (shouldSetProperty(node, name, value)) {
+  if (isDirectProp(node, name) || isHandler(name, value) || isDomNode(value)) {
     node[name] = value ?? null;
     return;
   }
 
   // a handler or node the name held gives way to the attribute
-  if (isHandler(name, node[name]) || isDomNode(node[name])) node[name] = null;
+  clearDynamicProp(node, name);
   DOMTemplateBuilder.prototype.setProp(node, name, value);
+}
+
+function deleteProp(node, name) {
+  if (isDirectProp(node, name)) node[name] = null;
+  else clearDynamicProp(node, name);
+  if (typeof name === 'string') node.removeAttribute(name);
 }
 
 /** @implements {TemplateBuilder<Node, DocumentFragment>} */
@@ -162,15 +175,16 @@ export class DOMBuilder extends DOMTemplateBuilder {
     const coerce = FORM_PROPS.get(node?.localName)?.get(name);
     if (coerce) {
       const next = coerce(value);
-      if (node[name] !== next) node[name] = next;
+      if (coerce !== asText || node[name] !== next) node[name] = next;
     } else writeProp(node, name, value);
   }
 
   unsetProp(node, name) {
     const coerce = FORM_PROPS.get(node?.localName)?.get(name);
-    if (coerce) node[name] = coerce(null);
-    else if (shouldSetProperty(node, name, node[name])) node[name] = null;
-    if (typeof name === 'string') node.removeAttribute(name);
+    if (coerce) {
+      node[name] = coerce(null);
+      node.removeAttribute(name);
+    } else deleteProp(node, name);
   }
 
   parent(node) {
@@ -260,8 +274,7 @@ export class SVGBuilder extends DOMBuilder {
   }
 
   unsetProp(node, name) {
-    if (shouldSetProperty(node, name, node[name])) node[name] = null;
-    if (typeof name === 'string') node.removeAttribute(name);
+    deleteProp(node, name);
   }
 }
 
