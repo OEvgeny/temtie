@@ -39,18 +39,21 @@ export function capture() {
   return makeRef(null).inst;
 }
 
+function targetOf(inst, name) {
+  const ref = inst?.[PRIVATE];
+  if (!ref) throw new TypeError(`temtie/core: ${name}() expects a target from mount() or capture()`);
+  return ref.target;
+}
+
 /** @type {Commit} */
 export function commit(inst) {
-  const ref = inst?.[PRIVATE];
-  if (!ref) throw new TypeError('temtie/core: commit() expects a target from mount() or capture()');
-  if (ref.target) commitTarget(ref.target);
+  const target = targetOf(inst, 'commit');
+  if (target) commitTarget(target);
 }
 
 /** @type {Skip} */
 export function skip(inst) {
-  const ref = inst?.[PRIVATE];
-  if (!ref) throw new TypeError('temtie/core: skip() expects a target from mount() or capture()');
-  const target = ref.target;
+  const target = targetOf(inst, 'skip');
   if (target?.state !== STAGED) return;
   discard(target);
   call(target, 'skip');
@@ -98,9 +101,7 @@ function voidOpened(target, since = target.pass) {
 // stage an empty pass. committed segments stay until commit and can be reused before then.
 /** @type {Reset} */
 export function reset(inst) {
-  const ref = inst?.[PRIVATE];
-  if (!ref) throw new TypeError('temtie/core: reset() expects a target from mount() or capture()');
-  const target = ref.target;
+  const target = targetOf(inst, 'reset');
   if (!target) return;
   if (target.state === STAGED) discard(target);
   call(target, 'reset');
@@ -262,27 +263,17 @@ function makeBinding(builder, hole, node) {
 function emit(target, segment) {
   if (segment === target.cursor) return;
   segment.pass = target.pass;
-  // one segment between the cursor and this one moves behind this one.
-  const ahead = target.cursor.next;
-  if (ahead && ahead !== segment && ahead.next === segment) {
-    ahead.next = segment.next;
-    if (segment.next) segment.next.prev = ahead;
-    segment.prev = target.cursor;
-    segment.next = ahead;
-    ahead.prev = segment;
-    target.cursor.next = segment;
-    ahead.sunk = true;
-    target.reordered = true;
-  }
-  if (target.cursor.next === segment) {
+  const tail = target.cursor.next;
+  if (tail === segment) {
     target.cursor = segment;
     return;
   }
+  // one segment between the cursor and this one moves behind this one.
+  if (tail && tail.next === segment) tail.sunk = true;
   if (segment.prev) {
     segment.prev.next = segment.next;
     if (segment.next) segment.next.prev = segment.prev;
   }
-  const tail = target.cursor.next;
   segment.prev = target.cursor;
   segment.next = tail;
   if (tail) tail.prev = segment;
@@ -328,7 +319,7 @@ const DEST = {
     },
     // repeated deliver is the receiver's problem. core does not diff it.
     deliver(binding) {
-      binding.builder.setProp(binding.node, binding.prop, binding.container ??= binding.builder.createRoot());
+      binding.builder.setProp(binding.node, binding.prop, binding.dest.container(binding));
     }
   },
   [HOLE.META]: {
