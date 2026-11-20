@@ -25,11 +25,11 @@ function toNodes(builder, value) {
 
 const isHandler = (name, value) => typeof name === 'string' && name.startsWith('on') && typeof value === 'function';
 
-const asText = (value) => value ?? '';
+const asText = (value) => (value == null ? '' : String(value));
 const FORM_PROPS = new Map([
   ['input', new Map([['value', asText], ['checked', Boolean], ['indeterminate', Boolean]])],
   ['textarea', new Map([['value', asText]])],
-  ['select', new Map([['value', asText], ['selectedIndex', (value) => value ?? -1]])],
+  ['select', new Map([['value', asText], ['selectedIndex', (value) => (value == null ? -1 : Number(value))]])],
   ['option', new Map([['selected', Boolean]])],
 ]);
 
@@ -160,8 +160,10 @@ export class DOMBuilder extends DOMTemplateBuilder {
 
   setProp(node, name, value) {
     const coerce = FORM_PROPS.get(node?.localName)?.get(name);
-    if (coerce) node[name] = coerce(value);
-    else writeProp(node, name, value);
+    if (coerce) {
+      const next = coerce(value);
+      if (node[name] !== next) node[name] = next;
+    } else writeProp(node, name, value);
   }
 
   unsetProp(node, name) {
