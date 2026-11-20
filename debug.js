@@ -1,5 +1,6 @@
 /* ꙋ temtie · debug.js */
-/** @import { DebugHub } from './types.d.ts' */
+/// <reference path="./types.d.ts" />
+/** @import { DebugHub } from 'temtie' */
 
 const listeners = new Set();
 

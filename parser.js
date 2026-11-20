@@ -1,5 +1,6 @@
 /* ꙋ temtie · parser.js */
-/** @import { TemplateBuilder, Template } from './types.d.ts' */
+/// <reference path="./types.d.ts" />
+/** @import { TemplateBuilder, Template } from 'temtie' */
 
 export const TEMPLATE_HOLE_TYPES = {
   CHILD: 'child',

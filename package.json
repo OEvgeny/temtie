@@ -13,6 +13,15 @@
   },
   "homepage": "https://github.com/OEvgeny/temtie#readme",
   "types": "./types.d.ts",
+  "typesVersions": {
+    "*": {
+      "core.js": ["./types.d.ts"],
+      "parser.js": ["./types.d.ts"],
+      "debug.js": ["./types.d.ts"],
+      "builder/dom.js": ["./types.d.ts"],
+      "builder/markup.js": ["./types.d.ts"]
+    }
+  },
   "files": [
     "*.js",
     "builder/*.js",

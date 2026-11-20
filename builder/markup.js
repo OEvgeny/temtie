@@ -1,5 +1,6 @@
 /* ꙋ temtie · builder · markup.js — the markup medium: an object tree, serialized on demand */
-/** @import { Builder, TemplateBuilder } from '../types.d.ts' */
+/// <reference path="../types.d.ts" />
+/** @import { Builder, TemplateBuilder } from 'temtie' */
 
 import { compileTemplate } from '../parser.js';
 

@@ -1,5 +1,6 @@
 /* ꙋ temtie · builder · dom.js */
-/** @import { Builder, TemplateBuilder } from '../types.d.ts' */
+/// <reference path="../types.d.ts" />
+/** @import { Builder, TemplateBuilder } from 'temtie' */
 
 import { compileTemplate } from '../parser.js';
 

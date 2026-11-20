@@ -1,5 +1,6 @@
 /* ꙋ temtie · core.js */
-/** @import { Mount, Capture, Commit, Skip, Reset } from './types.d.ts' */
+/// <reference path="./types.d.ts" />
+/** @import { Mount, Capture, Commit, Skip, Reset } from 'temtie' */
 
 import debug from './debug.js';
 
