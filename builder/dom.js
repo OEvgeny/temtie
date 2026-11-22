@@ -251,10 +251,9 @@ export class DOMBuilder extends DOMTemplateBuilder {
       }
     }
 
-    const before = marker.nextSibling;
     let tail = marker;
     for (const node of next) {
-      parent.insertBefore(node, before);
+      parent.insertBefore(node, tail.nextSibling);
       tail = node;
     }
     if (next.length > 1) (marker[OWNED] ??= new Map()).set(tail, new Set(next));
