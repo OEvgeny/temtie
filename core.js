@@ -342,7 +342,7 @@ const DEST = {
           delete bag[name];
         }
       for (const name of Object.keys(next))
-        if (bag[name] !== next[name]) {
+        if (!same(bag[name], next[name])) {
           binding.builder.setProp(binding.node, name, next[name]);
           bag[name] = next[name];
         }
