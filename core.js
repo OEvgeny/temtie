@@ -5,7 +5,6 @@
 import debug from './debug.js';
 
 const PRIVATE = Symbol('temtie.private');
-const UNSET = Symbol('temtie.unset');
 const VALUE = Symbol.for('temtie.value');
 const ROOT = 'root';
 
@@ -24,13 +23,6 @@ const same = (a, b) => a === b || (a !== a && b !== b);
 
 // undefined, null, true, and false are not keys. 0, '', and NaN are.
 const carriesIdentity = (key) => key !== undefined && key !== null && key !== true && key !== false;
-
-function reportError(error) {
-  try {
-    if (typeof globalThis.reportError === 'function') globalThis.reportError(error);
-    else globalThis.console?.error?.('temtie/core: hook failed', error);
-  } catch { /* best-effort */ }
-}
 
 /** @type {Mount} */
 export function mount(container, { builders } = {}) {
@@ -65,10 +57,12 @@ export function commit(inst) {
 export function discard(inst) {
   const target = targetOf(inst, 'discard');
   if (!target?.staged || target.staged.sealed) return;
-  voidOpened(target, target.staged.pass);
+  const old = target.staged;
+  voidOpened(target, old.pass);
   const pass = ++PASS;
   target.staged = { sealed: true, voided: false, pass, mode: 'replace' };
   debug.enabled && debug.emit({ type: 'call', target, pass, via: 'discard' });
+  retireDraft(old);
 }
 
 /** @type {Reset} */
@@ -151,9 +145,11 @@ function targetOf(inst, name, materialize = false) {
 }
 
 function beginDraft(target, mode, via) {
-  if (target.staged && !target.staged.sealed) voidOpened(target, target.staged.pass);
+  const old = target.staged && !target.staged.sealed ? target.staged : null;
+  if (old) voidOpened(target, old.pass);
   const draft = target.staged = makeDraft(mode);
   debug.enabled && debug.emit({ type: 'call', target, pass: draft.pass, via });
+  if (old) retireDraft(old);
   return draft;
 }
 
@@ -382,11 +378,65 @@ function reaches(node, goal, seen = new Set()) {
   return false;
 }
 
+function collectClaimRelease(binding, claim, releases) {
+  if (!claim || claim.committed || !claim.alive) return;
+  claim.alive = false;
+  if (claim.body?.staged && !claim.body.staged.sealed) {
+    const sub = claim.body.staged;
+    claim.body.staged = null;
+    collectDraftReleases(sub, releases);
+  }
+  debug.enabled && debug.emit({ type: 'end', binding, occupant: claim });
+  if (claim.hooks?.release) {
+    const h = handleOf(binding, claim);
+    releases.push(() => claim.hooks.release(h));
+  }
+}
+
+function collectDraftReleases(draft, releases) {
+  if (!draft?.edits) return;
+  for (const slots of draft.edits.values())
+    for (const [binding, occ] of slots)
+      if (occ?.kind === 'instance') collectClaimRelease(binding, occ, releases);
+}
+
+function runReleases(releases, errors) {
+  for (const run of releases) {
+    try { run(); }
+    catch (error) { errors.push(error); }
+  }
+}
+
+function throwErrors(errors) {
+  if (errors.length === 1) throw errors[0];
+  if (errors.length > 1) throw new AggregateError(errors, 'temtie/core: multiple release errors');
+}
+
+function drainReleases(releases, errors = []) {
+  runReleases(releases, errors);
+  throwErrors(errors);
+}
+
+function retireDraft(draft) {
+  const releases = [];
+  collectDraftReleases(draft, releases);
+  if (releases.length) drainReleases(releases);
+}
+
 function resolveSegment(target, draft, seg, values) {
   let slots = draft.edits?.get(seg) ?? null;
+  const retireStale = (binding, prev, next) => {
+    if (prev?.kind === 'instance' && prev !== next && !prev.committed && prev.alive) {
+      const releases = [];
+      collectClaimRelease(binding, prev, releases);
+      drainReleases(releases);
+    }
+  };
   const setSlot = (binding, occ) => {
+    const prev = slots?.get(binding);
     if (!slots) (draft.edits ??= new Map()).set(seg, slots = new Map());
     slots.set(binding, occ);
+    retireStale(binding, prev, occ);
   };
 
   for (const binding of seg.bindings) {
@@ -404,7 +454,9 @@ function resolveSegment(target, draft, seg, values) {
     }
     const occ = binding.occupant;
     if (occ ? (occ.kind === 'plain' && same(occ.prev, raw)) : !binding.dest.write) {
+      const prev = slots?.get(binding);
       slots?.delete(binding);
+      retireStale(binding, prev, null);
       continue;
     }
     setSlot(binding, { kind: 'plain', value: raw });
@@ -438,10 +490,11 @@ function resolveInstance(parent, draft, binding, raw, init) {
     throw new Error('temtie/core: a spread hole cannot host a contract');
 
   const props = raw.props ?? [],
-    existing = binding.occupant;
+    existing = binding.occupant,
+    isNew = !(existing?.kind === 'instance' && existing.init === init && existing.alive);
   let claim;
 
-  if (existing?.kind === 'instance' && existing.init === init && existing.alive) {
+  if (!isNew) {
     claim = existing;
   } else {
     // run init before storing in draft: a throw leaves zero residue
@@ -455,12 +508,21 @@ function resolveInstance(parent, draft, binding, raw, init) {
     claim.hooks = typeof made === 'function' ? { render: made } : made ?? {};
   }
 
-  claim.hooks.render?.(claim.ref.inst, ...props);
-  if (claim.body) {
-    if (reaches(claim.body, parent))
-      throw new Error('temtie/core: a target cannot be anchored beneath its descendant');
-    (draft.takenBodies ??= new Set()).add(claim.body);
-    (draft.children ??= new Set()).add(claim.body);
+  try {
+    claim.hooks.render?.(claim.ref.inst, ...props);
+    if (claim.body) {
+      if (reaches(claim.body, parent))
+        throw new Error('temtie/core: a target cannot be anchored beneath its descendant');
+      (draft.takenBodies ??= new Set()).add(claim.body);
+      (draft.children ??= new Set()).add(claim.body);
+    }
+  } catch (error) {
+    if (isNew) {
+      const releases = [];
+      collectClaimRelease(binding, claim, releases);
+      drainReleases(releases, [error]);
+    }
+    throw error;
   }
   return claim;
 }
@@ -603,18 +665,11 @@ function commitTarget(rootTarget) {
         }
       }
     } catch (error) {
-      rollbackTx(tx);
-      throw error;
+      rollbackTx(tx, error);
     }
 
     finalizeTx(tx);
-
-    let releaseError = UNSET;
-    for (const run of tx.releases) {
-      try { run(); }
-      catch (error) { if (releaseError === UNSET) releaseError = error; else reportError(error); }
-    }
-    if (releaseError !== UNSET) throw releaseError;
+    drainReleases(tx.releases);
 
     for (const run of tx.settles) run();
     debug.enabled && ev && debug.emit({ type: 'settled', target: rootTarget });
@@ -876,6 +931,11 @@ function finalizeTx(tx) {
         if (binding.occupant?.kind === 'instance') tx.endedClaims.push({ binding, claim: binding.occupant });
         if (binding.occupant?.body) queue.push(binding.occupant.body);
       }
+    if (body.staged && !body.staged.sealed) {
+      const sub = body.staged;
+      body.staged = null;
+      collectDraftReleases(sub, tx.releases);
+    }
     if (body.placedIn?.placedBody === body) body.placedIn.placedBody = null;
     body.parent?.children.delete(body);
     body.committed = [];
@@ -911,9 +971,21 @@ function pruneDropped(target, dropped) {
   }
 }
 
-// restores DOM back to V1 when Phase 1 throws; target.committed and target.staged remain intact
-function rollbackTx(tx) {
-  // 1. Undo newly committed V2 claims while their segments are still mounted
+// restores DOM back to V1 when Phase 1 throws and retires all failed draft-owned claims
+function rollbackTx(tx, cause) {
+  const detachedDrafts = [], releases = [];
+
+  // 1. Detach failed drafts before running any user release hooks
+  for (let i = tx.touched.length - 1; i >= 0; i--) {
+    const { target, draft } = tx.touched[i];
+    if (draft && target.staged === draft) {
+      voidOpened(target, draft.pass);
+      target.staged = null;
+      detachedDrafts.push(draft);
+    }
+  }
+
+  // 2. Clear DOM of newly committed V2 claims while their segments are still mounted
   for (let i = tx.edits.length - 1; i >= 0; i--) {
     const { binding, nextOcc, committedNew } = tx.edits[i];
     if (!committedNew || nextOcc?.kind !== 'instance') continue;
@@ -921,11 +993,10 @@ function rollbackTx(tx) {
     try { nextOcc.hooks?.clear?.(h); } catch { /* best-effort */ }
     if (binding.end) clearRange(binding);
     if (nextOcc.usedHole) try { binding.dest.clear?.(binding); } catch { /* best-effort */ }
-    nextOcc.alive = false;
-    try { nextOcc.hooks?.release?.(h); } catch { /* best-effort */ }
+    collectClaimRelease(binding, nextOcc, releases);
   }
 
-  // 2. Park V2-only segments and re-place V1 committed segments & parked bodies
+  // 3. Park V2-only segments and re-place V1 committed segments & parked bodies
   for (let i = tx.touched.length - 1; i >= 0; i--) {
     const { target, nextList } = tx.touched[i];
     const keep = new Set(target.committed);
@@ -938,15 +1009,30 @@ function rollbackTx(tx) {
   for (const body of tx.parkedBodies)
     if (body.placedIn) placeChain(body, body.placedIn, body.committed);
 
-  // 3. Restore V1 plain / spread / driver hole state now that V1 segments are back in DOM
+  // 4. Restore V1 plain / spread hole values now that V1 segments are back in DOM
   for (let i = tx.edits.length - 1; i >= 0; i--) {
     const { binding, prevBag } = tx.edits[i];
     const prev = binding.occupant;
     try {
       if (binding.dest.kind === HOLE.SPREAD) writeSpread(binding, prevBag ?? {});
       else if (prev?.kind === 'plain') binding.dest.write?.(binding, prev.prev);
-      else if (prev?.kind === 'instance') prev.hooks?.commit?.(handleOf(binding, prev));
-      else binding.dest.clear?.(binding);
+      else if (prev?.kind !== 'instance') binding.dest.clear?.(binding);
     } catch { /* best-effort */ }
   }
+
+  // 5. Retire all V2 draft-owned claims before re-attaching V1 hole-drivers
+  for (const draft of detachedDrafts) collectDraftReleases(draft, releases);
+  const errors = [cause];
+  runReleases(releases, errors);
+
+  // 6. Re-attach V1 hole-drivers after V2 releases have detached
+  for (let i = tx.edits.length - 1; i >= 0; i--) {
+    const { binding } = tx.edits[i];
+    const prev = binding.occupant;
+    if (prev?.kind === 'instance') {
+      try { prev.hooks?.commit?.(handleOf(binding, prev)); } catch { /* best-effort */ }
+    }
+  }
+
+  throwErrors(errors);
 }
