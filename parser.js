@@ -158,7 +158,7 @@ function parseTemplate(strings, builder) {
             break;
           }
 
-          if (!isNameStart(c))
+          if (c === 33 || !isNameStart(c))
             throw new SyntaxError(`${ERROR}invalid tag start after "<": "${part[j]}"`);
 
           nameStart = j;
@@ -333,7 +333,7 @@ function parseTemplate(strings, builder) {
           if (c === 62)
             throw new SyntaxError(`${ERROR}stray closing tag`);
 
-          if (!isNameStart(c))
+          if (c === 33 || !isNameStart(c))
             throw new SyntaxError(`${ERROR}invalid closing tag name start "${part[j]}"`);
 
           nameStart = j;
