@@ -17,6 +17,7 @@ export const TEMPLATE_HOLE_TYPES = {
 const HOLE = TEMPLATE_HOLE_TYPES;
 
 let PASS = 0;
+let APPLYING = false;
 
 // SameValueZero. NaN equals NaN.
 const same = (a, b) => a === b || (a !== a && b !== b);
@@ -108,10 +109,11 @@ function makeTarget(proto) {
   };
 }
 
-function makeDraft(mode) {
+function makeDraft(target, mode) {
   return {
     mode,
     pass: ++PASS,
+    base: target.committed, // snapshot of committed at draft start (protects prefix matching across reentrancy)
     sealed: false,
     voided: false,
     matched: 0,
@@ -147,7 +149,7 @@ function targetOf(inst, name, materialize = false) {
 function beginDraft(target, mode, via) {
   const old = target.staged && !target.staged.sealed ? target.staged : null;
   if (old) voidOpened(target, old.pass);
-  const draft = target.staged = makeDraft(mode);
+  const draft = target.staged = makeDraft(target, mode);
   debug.enabled && debug.emit({ type: 'call', target, pass: draft.pass, via });
   if (old) retireDraft(old);
   return draft;
@@ -282,15 +284,15 @@ function emitDraft(target, draft, seg, isCommitted) {
   seg.seenPass = draft.pass;
 
   if (draft.mode === 'amend') {
-    if (!isCommitted) (draft.list ??= target.committed.slice()).push(seg);
+    if (!isCommitted) (draft.list ??= draft.base.slice()).push(seg);
     return;
   }
   if (draft.list === null) {
-    if (draft.matched < target.committed.length && target.committed[draft.matched] === seg) {
+    if (draft.matched < draft.base.length && draft.base[draft.matched] === seg) {
       draft.matched++;
       return;
     }
-    draft.list = target.committed.slice(0, draft.matched);
+    draft.list = draft.base.slice(0, draft.matched);
   }
   draft.list.push(seg);
 }
@@ -608,6 +610,7 @@ function markKeepSet(nextList, committed, mark) {
 }
 
 function commitTarget(rootTarget) {
+  if (APPLYING) throw new Error('temtie/core: cannot call commit() while a commit is applying');
   if (rootTarget.staged?.sealed) {
     debug.enabled && debug.emit({ type: 'sealed', target: rootTarget, pass: rootTarget.staged.pass });
     return;
@@ -623,10 +626,12 @@ function commitTarget(rootTarget) {
     const tx = {
       touched: [], edits: [], vacated: [],
       flushed: new Map(),
+      bodyOwner: new Map(),
       parkedBodies: new Set(), claimedBodies: new Set([rootTarget]),
       maybeDispose: [], endedClaims: [], releases: [], settles: [],
     };
 
+    APPLYING = true;
     try {
       const queue = [{ target: rootTarget, anchor: rootTarget.anchor, parent: rootTarget.parent }];
       const queuedAnchor = new Map([[rootTarget, rootTarget.anchor]]);
@@ -635,6 +640,13 @@ function commitTarget(rootTarget) {
         const { target, anchor, parent } = queue[i];
         if (queuedAnchor.get(target) !== anchor) continue; // superseded by a move in this commit
         if (target.staged?.sealed) {
+          // sealed skips flushing and descending, but still places if the target moved
+          if (target.placedIn !== anchor)
+            settleSpan(target, 'place', () => {
+              tx.touched.push({ target, anchor, parent, nextList: target.committed, draft: null, dropped: null });
+              placeChain(target, anchor, target.committed);
+              if (target.committed.length) deliver(target, anchor);
+            });
           debug.enabled && debug.emit({ type: 'sealed', target, pass: target.staged.pass });
           continue;
         }
@@ -664,15 +676,19 @@ function commitTarget(rootTarget) {
             }
         }
       }
+      finalizeTx(tx);
     } catch (error) {
+      APPLYING = false;
       rollbackTx(tx, error);
+    } finally {
+      APPLYING = false;
     }
 
-    finalizeTx(tx);
-    drainReleases(tx.releases);
-
-    for (const run of tx.settles) run();
+    const errors = [];
+    runReleases(tx.releases, errors);
+    runReleases(tx.settles, errors);
     debug.enabled && ev && debug.emit({ type: 'settled', target: rootTarget });
+    throwErrors(errors);
   });
 }
 
@@ -764,11 +780,27 @@ function vacateDom(binding, occ, tx, nextKind) {
   }
 }
 
+function claimBodyOwner(body, kind, binding, owner, editEntry, tx) {
+  const prev = tx.bodyOwner.get(body);
+  if (prev && prev.binding !== binding) {
+    // supersede an earlier claim for this same body within the same commit
+    if (prev.kind === 'instance') tx.endedClaims.push({ binding: prev.binding, claim: prev.claim });
+    tx.edits.push({ binding: prev.binding, nextOcc: null, owner: prev.owner, prevBag: null, committedNew: false });
+    if (tx.flushed.has(body)) evictBody(body, tx);
+  }
+  tx.bodyOwner.set(body, { kind, binding, owner, editEntry, claim: kind === 'instance' ? editEntry?.nextOcc ?? binding.occupant : null });
+}
+
 function applyTarget(target, anchor, parent, tx, queue, queuedAnchor) {
+  // detach the draft before any user hook runs: reentrant recording starts a fresh draft
   const draft = target.staged, committed = target.committed;
+  target.staged = null;
+
   const nextList = draft.mode === 'amend'
-    ? (draft.list ?? committed)
-    : (draft.list ?? (draft.matched === committed.length ? committed : committed.slice(0, draft.matched)));
+    ? (draft.list ? (draft.base === committed ? draft.list : committed.concat(draft.created ?? [])) : committed)
+    : (draft.list ?? (draft.base === committed && draft.matched === committed.length
+      ? committed
+      : draft.base.slice(0, draft.matched)));
 
   const dropped = [];
   const droppedBindings = new Set();
@@ -821,8 +853,10 @@ function applyTarget(target, anchor, parent, tx, queue, queuedAnchor) {
         if (stagedOcc.kind === 'body') {
           const child = stagedOcc.body;
           tx.claimedBodies.add(child);
+          let editEntry = null;
           if (cur?.kind !== 'body' || cur.body !== child) {
-            tx.edits.push({ binding, nextOcc: { kind: 'body', body: child }, owner: target, prevBag, committedNew: false });
+            editEntry = { binding, nextOcc: { kind: 'body', body: child }, owner: target, prevBag, committedNew: false };
+            tx.edits.push(editEntry);
             if (cur) {
               vacateDom(binding, cur, tx, 'body');
               noteLeaving(binding, cur, tx);
@@ -835,6 +869,7 @@ function applyTarget(target, anchor, parent, tx, queue, queuedAnchor) {
               if (child.placedIn === oldHost || tx.flushed.has(child)) evictBody(child, tx);
             }
           }
+          claimBodyOwner(child, 'body', binding, target, editEntry, tx);
           if (queuedAnchor.get(child) !== binding) {
             queuedAnchor.set(child, binding);
             queue.push({ target: child, anchor: binding, parent: target });
@@ -857,6 +892,7 @@ function applyTarget(target, anchor, parent, tx, queue, queuedAnchor) {
         if (claim.hooks?.settle) tx.settles.push(() => claim.hooks.settle(handleOf(binding, claim)));
         if (claim.body) {
           tx.claimedBodies.add(claim.body);
+          claimBodyOwner(claim.body, 'instance', binding, target, editEntry, tx);
           if (queuedAnchor.get(claim.body) !== binding) {
             queuedAnchor.set(claim.body, binding);
             queue.push({ target: claim.body, anchor: binding, parent: target });
@@ -900,6 +936,7 @@ function finalizeTx(tx) {
       if (oldPlaced.placedBody === target) oldPlaced.placedBody = null;
       oldPlaced.dest.vacate?.(oldPlaced);
     }
+    if (target.parent && target.parent !== parent) target.parent.children.delete(target);
     target.anchor = target.placedIn = anchor;
     target.parent = parent;
     anchor.placedBody = target;
@@ -916,7 +953,6 @@ function finalizeTx(tx) {
         }
       }
       if (dropped?.length) pruneDropped(target, dropped);
-      target.staged = null;
     }
   }
 
@@ -975,12 +1011,11 @@ function pruneDropped(target, dropped) {
 function rollbackTx(tx, cause) {
   const detachedDrafts = [], releases = [];
 
-  // 1. Detach failed drafts before running any user release hooks
+  // 1. Collect detached failed drafts (already detached from target.staged on consume)
   for (let i = tx.touched.length - 1; i >= 0; i--) {
     const { target, draft } = tx.touched[i];
-    if (draft && target.staged === draft) {
+    if (draft) {
       voidOpened(target, draft.pass);
-      target.staged = null;
       detachedDrafts.push(draft);
     }
   }
