@@ -443,13 +443,19 @@ function resolveInstance(parent, binding, raw, init) {
     displace(binding);
     const ref = back?.ref ?? makeRef(makeTarget(parent.proto, null));
     occupant = binding.occupant = back
-      ?? { kind: 'instance', init, ref, body: ref.target, hooks: null, after: binding.marker };
+      ?? { kind: 'instance', init, ref, body: ref.target, hooks: {}, after: binding.marker };
     if (back) binding.leavers = binding.leavers.filter((occ) => occ !== back);
     debug.enabled && debug.emit({ type: 'claim', binding, occupant });
     hook(parent, occupant.body, binding);
     if (!back) {
-      const made = init(ref.inst, ...props);
-      occupant.hooks = typeof made === 'function' ? { render: made } : made ?? {};
+      try {
+        const made = init(ref.inst, ...props);
+        occupant.hooks = typeof made === 'function' ? { render: made } : made ?? {};
+      } catch (error) {
+        occupant.released = true;
+        if (binding.occupant === occupant) displace(binding);
+        throw error;
+      }
     }
   } else {
     hook(parent, occupant.body, binding);
