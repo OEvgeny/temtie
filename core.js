@@ -1,6 +1,6 @@
 /* ꙋ temtie · core.js */
 /// <reference path="./types.d.ts" />
-/** @import { Mount, Capture, Commit, Skip, Reset } from 'temtie' */
+/** @import { Mount, Capture, Commit, Discard, Reset } from 'temtie' */
 
 import debug from './debug.js';
 
@@ -52,17 +52,17 @@ export function commit(inst) {
   if (target) commitTarget(target);
 }
 
-/** @type {Skip} */
-export function skip(inst) {
-  const target = targetOf(inst, 'skip');
+/** @type {Discard} */
+export function discard(inst) {
+  const target = targetOf(inst, 'discard');
   if (target?.state !== STAGED) return;
-  discard(target);
-  call(target, 'skip');
+  undo(target);
+  call(target, 'discard');
   target.state = SEALED;
 }
 
 // a pass dropped before it commits closes the passes it opened, and its moves are undone.
-function discard(target) {
+function undo(target) {
   voidOpened(target);
   const moved = [...target.children];
   for (let index = 0; index < moved.length; index++)
@@ -119,7 +119,7 @@ function voidOpened(target, since = target.pass) {
 export function reset(inst) {
   const target = targetOf(inst, 'reset');
   if (!target) return;
-  if (target.state === STAGED) discard(target);
+  if (target.state === STAGED) undo(target);
   call(target, 'reset');
 }
 
@@ -219,7 +219,7 @@ function touch(target) {
     return;
   }
   // a pass started over is dropped
-  if (target.state === STAGED) discard(target);
+  if (target.state === STAGED) undo(target);
   call(target);
 }
 

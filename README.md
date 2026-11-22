@@ -52,7 +52,7 @@ whatever produces the calls produces the page.
   staged pass, parents before children, and one law covers every ending:
   what a pass did not stage leaves the medium and is disposed.
 
-Between record and commit there are two controls: `skip()` voids a staged
+Between record and commit there are two controls: `discard()` voids a staged
 pass while the committed output stands, and `reset()` stages emptiness.
 
 ## Mounts And Captures
@@ -139,17 +139,17 @@ root.html`<widget view=${pane}></widget>`;
 
 Spread slots cannot host targets or value contracts.
 
-## Skip And Reset
+## Discard And Reset
 
-`skip(target)` voids an uncommitted pass. The committed output remains, and
-nothing staged by the skipped pass is released.
+`discard(target)` voids an uncommitted pass. The committed output remains, and
+nothing staged by the discarded pass is released.
 
 ```js
 try {
   content.html`<article>${smh}</article>`;
   thisThrows();
 } catch (error) {
-  skip(content);
+  discard(content);
   errors.html`<pre>${error.message}</pre>`;
   content.html`${smh}`; // nested targets can be recovered
 }
@@ -262,7 +262,7 @@ into a slot that can host it.
 
 Settles the recorded pass for a target and staged or moved children under it.
 
-### `skip(target)`
+### `discard(target)`
 
 Voids the target's currently staged pass. Committed output stands.
 

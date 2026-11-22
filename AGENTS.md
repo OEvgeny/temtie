@@ -4,7 +4,7 @@
 This repository is organized as a small JavaScript package around immediate-mode
 template rendering with explicit record/commit phases.
 
-- `core.js`: public target runtime. Owns `mount`, `capture`, `commit`, `skip`,
+- `core.js`: public target runtime. Owns `mount`, `capture`, `commit`, `discard`,
   and `reset`.
 - `parser.js`: template parsing and compilation.
 - `debug.js`: debug event hub used by the runtime.

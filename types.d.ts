@@ -96,7 +96,7 @@ declare module 'temtie' {
   ) => Instance<Bs>;
   export type Capture = <Bs extends Builders = DefaultBuilders>() => Instance<Bs>;
   export type Commit = (instance: Instance<any>) => void;
-  export type Skip = (instance: Instance<any>) => void;
+  export type Discard = (instance: Instance<any>) => void;
   export type Reset = (instance: Instance<any>) => void;
 
   /* Debug */
@@ -106,7 +106,7 @@ declare module 'temtie' {
     readonly pass: number;
   }
 
-  export type DebugVia = 'render' | 'skip' | 'reset';
+  export type DebugVia = 'render' | 'discard' | 'reset';
 
   export type DebugOccupant =
     | { readonly kind: 'plain'; readonly after: unknown }
@@ -170,12 +170,12 @@ declare module 'temtie' {
 }
 
 declare module 'temtie/core.js' {
-  import type { Mount, Capture, Commit, Skip, Reset } from 'temtie';
+  import type { Mount, Capture, Commit, Discard, Reset } from 'temtie';
 
   export const mount: Mount;
   export const capture: Capture;
   export const commit: Commit;
-  export const skip: Skip;
+  export const discard: Discard;
   export const reset: Reset;
   export const TEMPLATE_HOLE_TYPES: {
     readonly CHILD: 'child';
