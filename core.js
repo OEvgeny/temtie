@@ -256,7 +256,6 @@ function makeBinding(builder, hole, node) {
     occupant: null,
     leavers: null,
     placedBody: null,
-    handle: null,
     bag: dest.kind === HOLE.SPREAD ? Object.create(null) : null,
   };
 }
@@ -301,9 +300,8 @@ const DEST = {
     kind: HOLE.CHILD,
     container: (binding) => binding.builder.parent(binding.marker),
     after: (binding) => binding.marker,
-    write(binding, value) {
+    write(binding, value, occupant) {
       debug.enabled && debug.emit({ type: 'write', binding, value });
-      const occupant = binding.occupant;
       occupant.after = binding.builder.setChild(binding.marker, occupant.after, value);
     },
     clear(binding, occupant) {
@@ -510,7 +508,7 @@ function end(binding, occupant, sink) {
   debug.enabled && debug.emit({ type: 'end', binding, occupant });
   // release once per claim: a retry after a later step threw does not release again.
   if (occupant.kind === 'instance' && !occupant.released) {
-    occupant.hooks.release?.(handleOf(binding));
+    occupant.hooks.release?.(handleOf(binding, occupant));
     occupant.released = true;
   }
   binding.dest.clear?.(binding, occupant);
@@ -773,25 +771,25 @@ function flushBinding(binding, values) {
   flushEnds(binding);
   const occupant = binding.occupant;
   if (!occupant) return;
-  if (occupant.kind === 'instance') occupant.hooks.commit?.(handleOf(binding));
+  if (occupant.kind === 'instance') occupant.hooks.commit?.(handleOf(binding, occupant));
   else if (occupant.kind === 'plain') {
     const value = values[binding.slot];
     if (!same(value, occupant.prev)) {
       // a throw may leave partial changes, so the old value is no longer settled.
       occupant.prev = UNSET;
-      binding.dest.write(binding, value);
+      binding.dest.write(binding, value, occupant);
       occupant.prev = value;
     }
   }
   // a body is flushed as its own target.
 }
 
-function handleOf(binding) {
-  return binding.handle ??= makeHandle(binding);
+function handleOf(binding, occupant) {
+  return occupant.handle ??= makeHandle(binding, occupant);
 }
 
 // set() exists only where the destination writes. a meta handle has none.
-function makeHandle(binding) {
+function makeHandle(binding, occupant) {
   const dest = binding.dest,
     handle = {
       kind: dest.kind,
@@ -801,6 +799,8 @@ function makeHandle(binding) {
       prop: binding.prop ?? null,
       name: binding.name,
     };
-  if (dest.write) handle.set = (value) => dest.write(binding, value);
+  if (dest.write) handle.set = (value) => {
+    if (!occupant.released) dest.write(binding, value, occupant);
+  };
   return handle;
 }
