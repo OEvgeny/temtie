@@ -4,17 +4,7 @@
 
 import { compileTemplate } from '../parser.js';
 
-// the medium is a plain object tree — no document, no platform. the tree is
-// the committed state; serialize() reads it whenever a string is wanted, so
-// one render serializes many times and a flow's settle re-serializes. the
-// builder is named for the medium it writes, not the syntax it accepts:
-// swap compile() and something other than html parses into the same tree.
-
-// a node the builder made carries this; a value is adopted as a node only if
-// it does. a plain object is data, not a node — it is String()'d, never moved
-// into the medium, and never mutated (Q44/Q45).
 const NODE = Symbol('markup.node');
-const OWNED = Symbol('markup.owned');
 
 function markTree(node) {
   if (!node || typeof node !== 'object') return;
@@ -121,14 +111,6 @@ function insertNodes(parent, items, after) {
   return nodes;
 }
 
-function toNodes(builder, value) {
-  if (value == null || value === false) return [];
-  if (value[NODE]) return value.type === '#fragment' ? [...value.children] : [value];
-  if (typeof value !== 'string' && typeof value[Symbol.iterator] === 'function')
-    return Array.from(value, (item) => toNodes(builder, item)).flat();
-  return [builder.createText(String(value))];
-}
-
 const NAMED_ENTITIES = new Map(Object.entries({
   amp: '&', lt: '<', gt: '>', quot: '"', apos: "'",
   nbsp: '\u00a0', ensp: '\u2002', emsp: '\u2003', thinsp: '\u2009', shy: '\u00ad', zwj: '\u200d', zwnj: '\u200c',
@@ -141,9 +123,6 @@ const NAMED_ENTITIES = new Map(Object.entries({
 
 const ENTITY = /&(#[xX]?[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]*);/g;
 
-// statics decode into the tree for common names and numeric references. A
-// static naming an entity this table lacks keeps its source, which serialize
-// writes as written, so the browser decodes the name itself
 const namesUnknown = (source) =>
   source.includes('&') && source.match(ENTITY)?.some((entity) => entity[1] !== '#' && !NAMED_ENTITIES.has(entity.slice(1, -1)));
 
@@ -231,8 +210,6 @@ export class MarkupBuilder {
   }
 
   extract(start, end) {
-    // like a DOM fragment, the lifted run keeps a parent: a range nested in it
-    // can still be lifted out on its own later
     const fragment = el('#fragment');
     fragment.children = spliceRange(start, end);
     for (const node of fragment.children) node.parent = fragment;
@@ -243,34 +220,12 @@ export class MarkupBuilder {
     for (const node of spliceRange(start, end)) node.parent = null;
   }
 
-  setChild(marker, after, value) {
-    const parent = marker.parent;
-    if (!parent) return after;
-
-    const next = toNodes(this, value);
-    if (after !== marker) {
-      const ranges = marker[OWNED],
-        owned = ranges?.get(after),
-        from = parent.children.indexOf(marker) + 1;
-      if (owned) {
-        let to = from;
-        while (owned.has(parent.children[to])) to++;
-        if (to > from) this.remove(parent.children[from], parent.children[to - 1]);
-        ranges.delete(after);
-        if (!ranges.size) marker[OWNED] = null;
-      } else if (parent.children[from] === after) {
-        this.remove(after, after);
-      }
-    }
-    const placed = next.length ? insertNodes(parent, next, marker) : [],
-      tail = placed.at(-1) ?? marker;
-    if (placed.length > 1) (marker[OWNED] ??= new Map()).set(tail, new Set(placed));
-    return tail;
+  // strict text write into the hole's permanent text anchor
+  setChild(anchor, value) {
+    anchor.text = value == null || value === false ? '' : String(value);
+    if ('source' in anchor) delete anchor.source;
   }
 
-  // props store raw values; what an attribute means is decided at serialize.
-  // storing false and deleting the key both serialize to absence — the same
-  // pair the dom builder spells as removeAttribute
   setProp(node, name, value, source) {
     node.props[name] = value;
     if (source !== undefined && namesUnknown(source)) (node.sources ??= {})[name] = source;
@@ -312,11 +267,6 @@ function serializeProps(props, sources) {
   return out;
 }
 
-// values never reach the markup as markup: a string value became a text node
-// at write time, and every text node and attribute value escapes here — the
-// parity the dom builder gets from the platform. this holds inside <script>
-// and <style> too: interpolating markup-significant text there is refused by
-// escaping, not honored
 function serializeNode(node, voidElements) {
   if (node == null || node.marker) return '';
   if ('text' in node) return node.source ?? escapeText(String(node.text));

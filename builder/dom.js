@@ -6,22 +6,9 @@ import { compileTemplate } from '../parser.js';
 
 const SVG_NAMESPACE = 'http://www.w3.org/2000/svg';
 const TEMTIE_PROP_NAMES = Symbol.for('temtie.propNames');
-// marks a text node setChild made from a value: only such a node is its to
-// rewrite in place. an adopted Text node is the caller's
-const OWN_TEXT = Symbol('temtie.ownText');
-const OWNED = Symbol('temtie.owned');
 
 function isDomNode(value) {
   return !!value && typeof value === 'object' && typeof value.nodeType === 'number';
-}
-
-function toNodes(builder, value) {
-  if (value == null || value === false) return [];
-  if (isDomNode(value))
-    return value.nodeType === 11 ? Array.from(value.childNodes) : [value];
-  if (typeof value !== 'string' && typeof value[Symbol.iterator] === 'function')
-    return Array.from(value, (item) => toNodes(builder, item)).flat();
-  return [builder.createText(String(value))];
 }
 
 const isHandler = (name, value) => typeof name === 'string' && name.startsWith('on') && typeof value === 'function';
@@ -92,10 +79,15 @@ class DOMTemplateBuilder {
     return this.#decoder.value;
   }
 
-  // <svg> opens the SVG namespace and its descendants inherit it; the children
-  // of a <foreignObject> are HTML again
+  // <svg> opens the SVG namespace and its descendants inherit it; children
+  // of <foreignObject> return to HTML. a builder's default namespace applies
+  // to top-level elements without a parent namespace
   createElement(tag, parent) {
-    return tag === 'svg' || (parent?.namespaceURI === SVG_NAMESPACE && parent.localName !== 'foreignObject')
+    const parentNs = parent?.namespaceURI;
+    const ns = parentNs
+      ? (parentNs === SVG_NAMESPACE && parent.localName === 'foreignObject' ? null : parentNs)
+      : this.#owner.namespace;
+    return tag === 'svg' || ns === SVG_NAMESPACE
       ? this.document.createElementNS(SVG_NAMESPACE, tag)
       : this.document.createElement(tag);
   }
@@ -147,26 +139,21 @@ class DOMTemplateBuilder {
   }
 }
 
-class SVGTemplateBuilder extends DOMTemplateBuilder {
-  createElement(tag, parent) {
-    return parent?.namespaceURI
-      ? super.createElement(tag, parent)
-      : this.document.createElementNS(SVG_NAMESPACE, tag);
-  }
-}
-
 /**
  * @implements {Builder<Node, DocumentFragment>}
  * @implements {TemplateBuilder<Node, DocumentFragment>}
  */
 export class DOMBuilder extends DOMTemplateBuilder {
   static TemplateBuilder = DOMTemplateBuilder;
+  static namespace = null;
   document;
+  namespace;
   #templateBuilder;
 
-  constructor(document = globalThis.document) {
+  constructor(document = globalThis.document, { namespace = undefined } = {}) {
     super();
     this.document = document;
+    this.namespace = namespace !== undefined ? namespace : this.constructor.namespace;
     this.#templateBuilder = new this.constructor.TemplateBuilder(this);
   }
 
@@ -222,56 +209,15 @@ export class DOMBuilder extends DOMTemplateBuilder {
     return node.previousSibling ?? null;
   }
 
-  // the marker anchors the range and survives every replacement
-  setChild(marker, after, value) {
-    const parent = marker.parentNode;
-    if (!parent) return after;
-
-    const first = after === marker ? null : marker.nextSibling,
-      ranges = marker[OWNED],
-      text = typeof value === 'string' || typeof value === 'number';
-    if (text && first === after && first?.[OWN_TEXT] && !ranges?.has(after)) {
-      first.data = String(value);
-      return first;
-    }
-
-    const next = toNodes(this, value);
-    if (text) next[0][OWN_TEXT] = true;
-
-    if (after !== marker) {
-      const owned = ranges?.get(after);
-      if (owned) {
-        if (owned.has(first)) {
-          let end = first;
-          while (owned.has(end.nextSibling)) end = end.nextSibling;
-          this.remove(first, end);
-        }
-        ranges.delete(after);
-        if (!ranges.size) marker[OWNED] = null;
-      } else if (first === after && first) {
-        this.remove(after, after);
-      }
-    }
-
-    let tail = marker;
-    for (const node of next) {
-      parent.insertBefore(node, tail.nextSibling);
-      tail = node;
-    }
-    if (next.length > 1) (marker[OWNED] ??= new Map()).set(tail, new Set(next));
-    return tail;
+  // strict text write into the hole's permanent Text anchor
+  setChild(anchor, value) {
+    anchor.data = value == null || value === false ? '' : String(value);
   }
 }
 
 export class SVGBuilder extends DOMBuilder {
-  static TemplateBuilder = SVGTemplateBuilder;
+  static namespace = SVG_NAMESPACE;
   static voidElements = new Set();
-
-  createElement(tag, parent) {
-    return parent?.namespaceURI
-      ? super.createElement(tag, parent)
-      : this.document.createElementNS(SVG_NAMESPACE, tag);
-  }
 
   setProp(node, name, value) {
     writeProp(node, name, value);

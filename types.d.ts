@@ -17,7 +17,7 @@ declare module 'temtie' {
     insert(parent: Node | Root, content: Node | Root, after?: Node | null): void;
     extract(start: Node, end: Node): Node | Root;
     remove(start: Node, end: Node): void;
-    setChild(marker: Node, after: Node, value: Renderable): Node;
+    setChild(anchor: Node, value: Renderable): void;
     setProp(node: Node, name: PropertyKeyLike, value: unknown, source?: string): void;
     unsetProp(node: Node, name: PropertyKeyLike): void;
   }
@@ -98,20 +98,20 @@ declare module 'temtie' {
   export type Commit = (instance: Instance<any>) => void;
   export type Discard = (instance: Instance<any>) => void;
   export type Reset = (instance: Instance<any>) => void;
+  export type Amend = (instance: Instance<any>) => void;
 
   /* Debug */
   export interface DebugTarget {
     readonly parent: DebugTarget | null;
     readonly children: ReadonlySet<DebugTarget>;
-    readonly pass: number;
   }
 
-  export type DebugVia = 'render' | 'discard' | 'reset';
+  export type DebugVia = 'render' | 'discard' | 'reset' | 'amend';
 
   export type DebugOccupant =
-    | { readonly kind: 'plain'; readonly after: unknown }
+    | { readonly kind: 'plain' }
     | { readonly kind: 'body'; readonly body: DebugTarget }
-    | { readonly kind: 'instance'; readonly body: DebugTarget; readonly init: Function; readonly after: unknown };
+    | { readonly kind: 'instance'; readonly body: DebugTarget | null; readonly init: Function };
 
   export interface DebugBinding {
     readonly dest: { readonly kind: 'root' | 'child' | 'attr' | 'meta' | 'spread' };
@@ -125,7 +125,6 @@ declare module 'temtie' {
 
   export interface DebugSegment {
     readonly template: Template;
-    readonly pass: number;
   }
 
   interface DebugEventBase {
@@ -170,13 +169,14 @@ declare module 'temtie' {
 }
 
 declare module 'temtie/core.js' {
-  import type { Mount, Capture, Commit, Discard, Reset } from 'temtie';
+  import type { Mount, Capture, Commit, Discard, Reset, Amend } from 'temtie';
 
   export const mount: Mount;
   export const capture: Capture;
   export const commit: Commit;
   export const discard: Discard;
   export const reset: Reset;
+  export const amend: Amend;
   export const TEMPLATE_HOLE_TYPES: {
     readonly CHILD: 'child';
     readonly ATTR: 'attr';
@@ -212,9 +212,11 @@ declare module 'temtie/builder/dom.js' {
 
   export class DOMBuilder {
     static voidElements: Set<string>;
+    static namespace: string | null;
     static TemplateBuilder: new (owner: DOMBuilder) => TemplateBuilder<Node, DocumentFragment>;
-    constructor(document?: Document);
+    constructor(document?: Document, options?: { namespace?: string | null });
     readonly document: Document;
+    readonly namespace: string | null;
   }
   export interface DOMBuilder extends Builder<Node, DocumentFragment>, TemplateBuilder<Node, DocumentFragment> {}
 

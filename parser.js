@@ -36,6 +36,11 @@ function isNameChar(c) {
   return c < 128 ? (ASCII[c] & DELIMITER) === 0 : !isWideSpace(c);
 }
 
+// tag names start with an ASCII letter; attribute names keep prefixes like ., @, ?, #
+function isTagStart(c) {
+  return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
+}
+
 function isNameStart(c) {
   return (c < 48 || c > 57) && isNameChar(c);
 }
@@ -69,7 +74,7 @@ function parseTemplate(strings, builder) {
     pendingTag = '',
     attrNames = null,
     keySlot = -1,
-    lastHoleMarker = null;
+    lastHoleAnchor = null;
 
   function insertText(text) {
     builder.insert(ctx.node, builder.createText(decodeStatic(text, 'text'), text));
@@ -158,7 +163,7 @@ function parseTemplate(strings, builder) {
             break;
           }
 
-          if (c === 33 || !isNameStart(c))
+          if (!isTagStart(c))
             throw new SyntaxError(`${ERROR}invalid tag start after "<": "${part[j]}"`);
 
           nameStart = j;
@@ -225,7 +230,7 @@ function parseTemplate(strings, builder) {
           if (spreadDots !== 0) {
             if (spreadDots === 3) throw spreadWithoutHole();
 
-            // dots short of a spread open the name: `..x` is a name
+            // dots short of a spread open the name: `.prop` or `..x` is a name
             attrStart = j - spreadDots;
             spreadDots = 0;
 
@@ -333,7 +338,7 @@ function parseTemplate(strings, builder) {
           if (c === 62)
             throw new SyntaxError(`${ERROR}stray closing tag`);
 
-          if (c === 33 || !isNameStart(c))
+          if (!isTagStart(c))
             throw new SyntaxError(`${ERROR}invalid closing tag name start "${part[j]}"`);
 
           nameStart = j;
@@ -381,13 +386,13 @@ function parseTemplate(strings, builder) {
     // the interpolation after static `i`
     switch (mode) {
       case TEXT: {
-        // a child hole is a single marker: a permanent anchor that content
-        // lands after, referenced only while the hole has no content to speak for it
-        const marker = builder.createMarker();
-        builder.insert(ctx.node, marker);
+        // a child hole starts as a single empty text node: plain values write
+        // into it in place, while captures and ranges land after it
+        const anchor = builder.createText('');
+        builder.insert(ctx.node, anchor);
         holes.push({ type: TEMPLATE_HOLE_TYPES.CHILD, slot: i });
         paths.push([...ctx.path, ctx.childIndex]);
-        if (ctx.node === fragment) lastHoleMarker = marker;
+        if (ctx.node === fragment) lastHoleAnchor = anchor;
         ctx.childIndex++;
         break;
       }
@@ -485,7 +490,7 @@ function parseTemplate(strings, builder) {
   // a segment needs physical boundaries: an empty template gets a marker, and
   // a template ending in a top-level hole gets a trailing pin
   const tail = builder.lastChild(fragment);
-  if (!tail || tail === lastHoleMarker)
+  if (!tail || tail === lastHoleAnchor)
     builder.insert(fragment, builder.createMarker());
 
   return { fragment, holes, paths, keySlot };
