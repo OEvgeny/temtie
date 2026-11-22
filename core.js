@@ -104,6 +104,7 @@ function makeTarget(proto) {
     committed: [],
     buckets: new Map(),
     placedIn: null,
+    ownerClaim: null, // lazy claim back-pointer until committed
     // staged draft — null while idle
     staged: null,
   };
@@ -131,12 +132,9 @@ function materializeTarget(ref) {
   const claim = ref.claim;
   if (claim.usedHole)
     throw new Error('temtie/core: a contract that wrote through handle cannot also stage templates');
-  const target = ref.target = claim.body = makeTarget(claim.proto);
-  if (claim.committed && claim.binding) {
-    target.anchor = claim.binding;
-    target.parent = claim.owner;
-    claim.owner?.children.add(target);
-  }
+  // keep committed state (claim.body, anchor, parent, owner.children) untouched until commit
+  const target = ref.target = makeTarget(claim.proto);
+  target.ownerClaim = claim;
   return target;
 }
 
@@ -383,9 +381,10 @@ function reaches(node, goal, seen = new Set()) {
 function collectClaimRelease(binding, claim, releases) {
   if (!claim || claim.committed || !claim.alive) return;
   claim.alive = false;
-  if (claim.body?.staged && !claim.body.staged.sealed) {
-    const sub = claim.body.staged;
-    claim.body.staged = null;
+  const body = claim.body ?? claim.ref?.target;
+  if (body?.staged && !body.staged.sealed) {
+    const sub = body.staged;
+    body.staged = null;
     collectDraftReleases(sub, releases);
   }
   debug.enabled && debug.emit({ type: 'end', binding, occupant: claim });
@@ -485,6 +484,10 @@ function resolveBody(parent, draft, seg, binding, ref, values) {
   return child;
 }
 
+const activeLazyBody = (claim) =>
+  claim.ref?.target?.staged && !claim.ref.target.staged.sealed && !claim.ref.target.staged.voided
+    ? claim.ref.target : null;
+
 function resolveInstance(parent, draft, binding, raw, init) {
   if (typeof init !== 'function')
     throw new TypeError('temtie/core: a contract value must carry an init function under Symbol.for("temtie.value")');
@@ -512,11 +515,12 @@ function resolveInstance(parent, draft, binding, raw, init) {
 
   try {
     claim.hooks.render?.(claim.ref.inst, ...props);
-    if (claim.body) {
-      if (reaches(claim.body, parent))
+    const body = claim.body ?? activeLazyBody(claim);
+    if (body) {
+      if (reaches(body, parent))
         throw new Error('temtie/core: a target cannot be anchored beneath its descendant');
-      (draft.takenBodies ??= new Set()).add(claim.body);
-      (draft.children ??= new Set()).add(claim.body);
+      (draft.takenBodies ??= new Set()).add(body);
+      (draft.children ??= new Set()).add(body);
     }
   } catch (error) {
     if (isNew) {
@@ -550,6 +554,8 @@ function clearRange(binding) {
 
 const handleOf = (binding, claim) => claim.handle ??= makeHandle(binding, claim);
 
+const hasClaimBody = (claim) => !!(claim.body || activeLazyBody(claim));
+
 function makeHandle(binding, claim) {
   const dest = binding.dest;
   const handle = {
@@ -559,7 +565,7 @@ function makeHandle(binding, claim) {
   if (dest.write) {
     handle.set = (value) => {
       if (!claim.alive) return;
-      if (claim.body) throw new Error('temtie/core: a contract with staged content cannot also write through handle.set()');
+      if (hasClaimBody(claim)) throw new Error('temtie/core: a contract with staged content cannot also write through handle.set()');
       claim.usedHole = true;
       if (binding.end) clearRange(binding);
       dest.write(binding, value);
@@ -568,7 +574,7 @@ function makeHandle(binding, claim) {
   if (dest.kind === HOLE.CHILD) {
     handle.range = () => {
       if (!claim.alive) return null;
-      if (claim.body) throw new Error('temtie/core: a contract with staged content cannot also claim handle.range()');
+      if (hasClaimBody(claim)) throw new Error('temtie/core: a contract with staged content cannot also claim handle.range()');
       claim.usedHole = true;
       if (!binding.end) {
         const parent = binding.builder.parent(binding.marker);
@@ -609,13 +615,23 @@ function markKeepSet(nextList, committed, mark) {
   for (let k = tails[tails.length - 1]; k >= 0; k = prev[k]) segs[k].keepPass = mark;
 }
 
+function needsPlace(target, anchor, tx) {
+  return target.placedIn !== anchor
+    || tx.parkedBodies.has(target)
+    || (target.committed.length > 0 && target.committed[0].parked !== null);
+}
+
 function commitTarget(rootTarget) {
   if (APPLYING) throw new Error('temtie/core: cannot call commit() while a commit is applying');
   if (rootTarget.staged?.sealed) {
     debug.enabled && debug.emit({ type: 'sealed', target: rootTarget, pass: rootTarget.staged.pass });
     return;
   }
-  if (!rootTarget.anchor) throw new Error('temtie/core: cannot commit an unanchored capture');
+  const lazyClaim = !rootTarget.anchor && rootTarget.ownerClaim?.committed && rootTarget.ownerClaim.alive
+    ? rootTarget.ownerClaim : null;
+  const rootAnchor = rootTarget.anchor ?? lazyClaim?.binding ?? null;
+  const rootParent = rootTarget.anchor ? rootTarget.parent : lazyClaim?.owner ?? null;
+  if (!rootAnchor) throw new Error('temtie/core: cannot commit an unanchored capture');
 
   const ev = debug.enabled && debug.emit({
     type: 'commit', target: rootTarget, pass: rootTarget.staged?.pass ?? 0,
@@ -633,15 +649,15 @@ function commitTarget(rootTarget) {
 
     APPLYING = true;
     try {
-      const queue = [{ target: rootTarget, anchor: rootTarget.anchor, parent: rootTarget.parent }];
-      const queuedAnchor = new Map([[rootTarget, rootTarget.anchor]]);
+      const queue = [{ target: rootTarget, anchor: rootAnchor, parent: rootParent }];
+      const queuedAnchor = new Map([[rootTarget, rootAnchor]]);
 
       for (let i = 0; i < queue.length; i++) {
         const { target, anchor, parent } = queue[i];
         if (queuedAnchor.get(target) !== anchor) continue; // superseded by a move in this commit
         if (target.staged?.sealed) {
-          // sealed skips flushing and descending, but still places if the target moved
-          if (target.placedIn !== anchor)
+          // sealed skips flushing and descending, but still places if moved or physically parked
+          if (needsPlace(target, anchor, tx))
             settleSpan(target, 'place', () => {
               tx.touched.push({ target, anchor, parent, nextList: target.committed, draft: null, dropped: null });
               placeChain(target, anchor, target.committed);
@@ -662,7 +678,7 @@ function commitTarget(rootTarget) {
         if (target.staged) {
           settleSpan(target, 'flush', () => applyTarget(target, anchor, parent, tx, queue, queuedAnchor));
         } else {
-          if (target.placedIn !== anchor)
+          if (needsPlace(target, anchor, tx))
             settleSpan(target, 'place', () => {
               tx.touched.push({ target, anchor, parent, nextList: target.committed, draft: null, dropped: null });
               placeChain(target, anchor, target.committed);
@@ -712,8 +728,9 @@ function inPlace(anchor, seg, prevEnd) {
     : builder.parent(seg.start) === anchor.dest.container(anchor);
 }
 
-function parkSeg(seg, tx) {
-  for (const binding of seg.bindings) if (binding.placedBody) evictBody(binding.placedBody, tx);
+function parkSeg(seg, tx, liftBodies = true) {
+  if (liftBodies)
+    for (const binding of seg.bindings) if (binding.placedBody) evictBody(binding.placedBody, tx);
   if (!seg.parked && seg.builder.parent(seg.start))
     seg.parked = seg.builder.extract(seg.start, seg.end);
 }
@@ -721,7 +738,7 @@ function parkSeg(seg, tx) {
 function evictBody(body, tx) {
   tx?.parkedBodies.add(body);
   const list = tx?.flushed.get(body) ?? body.committed;
-  for (const seg of list) parkSeg(seg, tx);
+  for (const seg of list) parkSeg(seg, tx, true);
 }
 
 function placeSeg(target, anchor, seg, prevEnd) {
@@ -825,7 +842,8 @@ function applyTarget(target, anchor, parent, tx, queue, queuedAnchor) {
     if (nextList !== committed && target.placedIn === anchor) {
       const mark = ++PASS;
       markKeepSet(nextList, committed, mark);
-      for (const seg of nextList) if (!seg.parked && seg.keepPass !== mark) parkSeg(seg, tx);
+      // reordered segments keep their hosted child bodies intact and move as one subtree
+      for (const seg of nextList) if (!seg.parked && seg.keepPass !== mark) parkSeg(seg, tx, false);
     }
     placeChain(target, anchor, nextList);
   } else if (nextList.length && !inPlace(anchor, nextList[0], null)) {
@@ -890,12 +908,13 @@ function applyTarget(target, anchor, parent, tx, queue, queuedAnchor) {
         claim.hooks?.commit?.(handleOf(binding, claim));
         if (editEntry) editEntry.committedNew = true;
         if (claim.hooks?.settle) tx.settles.push(() => claim.hooks.settle(handleOf(binding, claim)));
-        if (claim.body) {
-          tx.claimedBodies.add(claim.body);
-          claimBodyOwner(claim.body, 'instance', binding, target, editEntry, tx);
-          if (queuedAnchor.get(claim.body) !== binding) {
-            queuedAnchor.set(claim.body, binding);
-            queue.push({ target: claim.body, anchor: binding, parent: target });
+        const body = claim.body ?? activeLazyBody(claim);
+        if (body) {
+          tx.claimedBodies.add(body);
+          claimBodyOwner(body, 'instance', binding, target, editEntry, tx);
+          if (queuedAnchor.get(body) !== binding) {
+            queuedAnchor.set(body, binding);
+            queue.push({ target: body, anchor: binding, parent: target });
           }
         }
       }
@@ -941,6 +960,8 @@ function finalizeTx(tx) {
     target.parent = parent;
     anchor.placedBody = target;
     parent?.children.add(target);
+    if (target.ownerClaim && target.ownerClaim.binding === anchor)
+      target.ownerClaim.body = target;
 
     if (draft) {
       target.committed = nextList;
@@ -983,6 +1004,11 @@ function finalizeTx(tx) {
   for (const { binding, claim } of tx.endedClaims) {
     if (!claim.alive) continue;
     claim.alive = false;
+    if (!claim.body && claim.ref?.target?.staged && !claim.ref.target.staged.sealed) {
+      const sub = claim.ref.target.staged;
+      claim.ref.target.staged = null;
+      collectDraftReleases(sub, tx.releases);
+    }
     debug.enabled && debug.emit({ type: 'end', binding, occupant: claim });
     if (claim.hooks?.release) {
       const h = handleOf(binding, claim);
