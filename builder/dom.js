@@ -148,8 +148,10 @@ class DOMTemplateBuilder {
 }
 
 class SVGTemplateBuilder extends DOMTemplateBuilder {
-  createElement(tag) {
-    return this.document.createElementNS(SVG_NAMESPACE, tag);
+  createElement(tag, parent) {
+    return parent?.namespaceURI
+      ? super.createElement(tag, parent)
+      : this.document.createElementNS(SVG_NAMESPACE, tag);
   }
 }
 
@@ -265,8 +267,10 @@ export class SVGBuilder extends DOMBuilder {
   static TemplateBuilder = SVGTemplateBuilder;
   static voidElements = new Set();
 
-  createElement(tag) {
-    return this.document.createElementNS(SVG_NAMESPACE, tag);
+  createElement(tag, parent) {
+    return parent?.namespaceURI
+      ? super.createElement(tag, parent)
+      : this.document.createElementNS(SVG_NAMESPACE, tag);
   }
 
   setProp(node, name, value) {
