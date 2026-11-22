@@ -65,11 +65,26 @@ export function skip(inst) {
 function discard(target) {
   voidOpened(target);
   const moved = [...target.children];
+  for (let index = 0; index < moved.length; index++)
+    if (!moved[index].placedIn) moved.push(...moved[index].children);
   // a body the pass displaced is in no target's children, only among the leavers
   for (let segment = target.head.next; segment; segment = segment.next)
     for (const binding of segment.bindings)
       for (const { body } of binding.leavers ?? []) if (body && !body.anchor) moved.push(body);
   for (const body of moved) restore(body, target);
+  for (let segment = target.head.next; segment; segment = segment.next)
+    for (const binding of segment.bindings) restoreHole(binding);
+}
+
+// an unplaced target staged by the dropped pass leaves the hole, and any committed plain value returns.
+function restoreHole(binding) {
+  const occupant = binding.occupant;
+  if (occupant?.body && occupant.body.placedIn !== binding) displace(binding);
+  const back = binding.leavers?.findLast((occ) => occ.kind === 'plain' && occ.prev !== UNSET);
+  if (!back || (binding.occupant && binding.occupant.prev !== UNSET)) return;
+  binding.leavers = binding.leavers.filter((occ) => occ !== back);
+  binding.occupant = back;
+  debug.enabled && debug.emit({ type: 'claim', binding, occupant: back });
 }
 
 // a body the pass took from a committed hole goes back. a hole of this target gives up what the pass
@@ -381,6 +396,7 @@ function resolveSegment(target, segment, values) {
 }
 
 function holds(binding, raw) {
+  if (binding.leavers?.length) return false;
   const occupant = binding.occupant;
   if (!occupant) return !binding.dest.write;
   return occupant.kind === 'plain' && same(occupant.prev, raw);
