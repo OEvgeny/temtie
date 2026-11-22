@@ -70,7 +70,7 @@ function undo(target) {
   // a body the pass displaced is in no target's children, only among the leavers
   for (let segment = target.head.next; segment; segment = segment.next)
     for (const binding of segment.bindings)
-      for (const { body } of binding.leavers ?? []) if (body && !body.anchor) moved.push(body);
+      for (const { body, ending } of binding.leavers ?? []) if (body && !body.anchor && !ending) moved.push(body);
   for (const body of moved) restore(body, target);
   for (let segment = target.head.next; segment; segment = segment.next)
     for (const binding of segment.bindings) restoreHole(binding);
@@ -80,7 +80,7 @@ function undo(target) {
 function restoreHole(binding) {
   const occupant = binding.occupant;
   if (occupant?.body && occupant.body.placedIn !== binding) displace(binding);
-  const back = binding.leavers?.findLast((occ) => occ.kind === 'plain' && occ.prev !== UNSET);
+  const back = binding.leavers?.findLast((occ) => occ.kind === 'plain' && occ.prev !== UNSET && !occ.ending);
   if (!back || (binding.occupant && binding.occupant.prev !== UNSET)) return;
   binding.leavers = binding.leavers.filter((occ) => occ !== back);
   binding.occupant = back;
@@ -425,7 +425,7 @@ function resolveBody(parent, segment, binding, ref) {
     child = ref.target
       ?? (occupant?.kind === 'body' && !carried(occupant.body, segment) ? occupant.body : null)
       // a body displaced and not flushed is still committed. a fresh capture reuses it.
-      ?? binding.leavers?.findLast((occ) => occ.kind === 'body' && !occ.body.anchor && !carried(occ.body, segment))?.body
+      ?? binding.leavers?.findLast((occ) => occ.kind === 'body' && !occ.body.anchor && !occ.ending && !carried(occ.body, segment))?.body
       ?? makeTarget(parent.proto, null);
   if (ref.target !== child) {
     ref.target = child;
@@ -453,7 +453,7 @@ function resolveInstance(parent, binding, raw, init) {
   let occupant = binding.occupant;
   if (occupant?.kind !== 'instance' || occupant.init !== init) {
     // same init, pass not flushed: reuse the claim. do not call init again.
-    const back = binding.leavers?.findLast((occ) => occ.kind === 'instance' && occ.init === init && !occ.released);
+    const back = binding.leavers?.findLast((occ) => occ.kind === 'instance' && occ.init === init && !occ.ending);
     displace(binding);
     const ref = back?.ref ?? makeRef(makeTarget(parent.proto, null));
     occupant = binding.occupant = back
@@ -466,7 +466,7 @@ function resolveInstance(parent, binding, raw, init) {
         const made = init(ref.inst, ...props);
         occupant.hooks = typeof made === 'function' ? { render: made } : made ?? {};
       } catch (error) {
-        occupant.released = true;
+        occupant.ending = occupant.released = true;
         if (binding.occupant === occupant) displace(binding);
         throw error;
       }
@@ -522,6 +522,7 @@ function unhook(body) {
 
 function end(binding, occupant, sink) {
   debug.enabled && debug.emit({ type: 'end', binding, occupant });
+  occupant.ending = true;
   // release once per claim: a retry after a later step threw does not release again.
   if (occupant.kind === 'instance' && !occupant.released) {
     occupant.hooks.release?.(handleOf(binding, occupant));
@@ -577,16 +578,19 @@ function park(segment) {
 }
 
 // end only at flush. a voided pass frees nothing.
-// the list as taken. a throw keeps the front occupant. a push during end waits for the next flush.
+// detach the batch before hooks run: a throw puts the rest back in front, pushes wait for the next flush.
 function flushEnds(binding, sink = disposeTarget) {
-  const leavers = binding.leavers;
-  if (!leavers) return;
-  const count = leavers.length;
-  for (let index = 0; index < count; index++) {
-    end(binding, leavers[0], sink);
-    leavers.shift();
+  const batch = binding.leavers;
+  if (!batch) return;
+  binding.leavers = null;
+  for (let index = 0; index < batch.length; index++) {
+    try {
+      end(binding, batch[index], sink);
+    } catch (error) {
+      binding.leavers = binding.leavers ? batch.slice(index).concat(binding.leavers) : batch.slice(index);
+      throw error;
+    }
   }
-  if (binding.leavers === leavers && !leavers.length) binding.leavers = null;
 }
 
 function sweepSegment(segment, sink) {
