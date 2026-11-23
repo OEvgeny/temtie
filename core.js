@@ -135,7 +135,7 @@ function beginDraft(target, mode, via) {
   return draft;
 }
 
-function dropOpened(root, since) {
+function dropOpened(root, since, rootDraft = root.staged, until = Infinity) {
   const seen = new Set([root]), queue = [root];
   const visit = (child) => {
     if (seen.has(child)) return;
@@ -144,11 +144,12 @@ function dropOpened(root, since) {
   };
   for (let i = 0; i < queue.length; i++) {
     const cur = queue[i];
+    const draft = i === 0 ? rootDraft : cur.staged;
     for (const child of cur.children) visit(child);
-    if (cur.staged?.children)
-      for (const child of cur.staged.children)
+    if (draft?.children)
+      for (const child of draft.children)
         if (!child.anchor && !(child.ownerClaim?.binding && child.ownerClaim.alive)) visit(child);
-    if (cur !== root && cur.staged && cur.staged.pass > since) cur.staged = null;
+    if (i > 0 && cur.staged && cur.staged.pass > since && cur.staged.pass <= until) cur.staged = null;
   }
 }
 
@@ -652,7 +653,7 @@ function planCommit(rootTarget, rootAnchor, rootParent) {
     }
   };
 
-  let i = 0, stagingRef = null;
+  let i = 0, stagingRef = null, failPass = Infinity, ok = false;
   PLAN_NODES = nodes;
   try {
     for (; i < queue.length; i++) {
@@ -681,7 +682,9 @@ function planCommit(rootTarget, rootAnchor, rootParent) {
         const stageFn = stageOf(entry.spec);
         if (stageFn) {
           const ref = stagingRef = claim.ref ??= makeRef(null, claim);
+          failPass = PASS;
           stageFn(ref.inst, claim.staged === UNSET ? undefined : claim.staged, entry.raw);
+          failPass = Infinity;
           stagingRef = null;
         }
         const body = claim.body ?? activeLazyBody(claim);
@@ -695,11 +698,22 @@ function planCommit(rootTarget, rootAnchor, rootParent) {
       const node = queue[k], parentNode = node.parent && nodes.get(node.parent);
       if (parentNode) (parentNode.children ??= []).push(node);
     }
+    ok = true;
     return { rootNode, nodes, queue };
   } finally {
     PLAN_NODES = null;
-    if (stagingRef?.target?.staged) stagingRef.target.staged = null;
-    for (let j = i + 1; j < queue.length; j++) queue[j].target.staged = null;
+    if (!ok) {
+      if (stagingRef?.target?.staged) {
+        dropOpened(stagingRef.target, 0);
+        stagingRef.target.staged = null;
+      }
+      for (let j = 0; j < queue.length; j++) {
+        const node = queue[j], t = node.target;
+        const d = node.draft ?? (t.staged?.pass <= failPass ? t.staged : null);
+        dropOpened(t, 0, d, failPass);
+        if (t.staged && t.staged.pass <= failPass) t.staged = null;
+      }
+    }
   }
 }
 
@@ -716,7 +730,7 @@ function recoverApply(queue, errors, rootTarget, applied) {
           else { (applied.tried ??= new Set()).add(seg); queuePending(owner, seg); }
         }
     }
-    dropOpened(node.target, node.draft.pass);
+    dropOpened(node.target, node.draft.pass, node.draft);
   }
 }
 
