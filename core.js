@@ -125,6 +125,7 @@ function makeDraft(target, mode) {
     createdKeys: null,
     children: null,
     takenBodies: null,
+    ownedBodies: null,
   };
 }
 
@@ -378,14 +379,14 @@ function reaches(node, goal, seen = new Set()) {
   return false;
 }
 
-function collectClaimRelease(binding, claim, releases) {
+function collectClaimRelease(binding, claim, releases, seen = new Set()) {
   if (!claim || claim.committed || !claim.alive) return;
   claim.alive = false;
   const body = claim.body ?? claim.ref?.target;
   if (body?.staged && !body.staged.sealed) {
     const sub = body.staged;
     body.staged = null;
-    collectDraftReleases(sub, releases);
+    collectDraftReleases(sub, releases, seen);
   }
   debug.enabled && debug.emit({ type: 'end', binding, occupant: claim });
   if (claim.hooks?.release) {
@@ -394,11 +395,24 @@ function collectClaimRelease(binding, claim, releases) {
   }
 }
 
-function collectDraftReleases(draft, releases) {
-  if (!draft?.edits) return;
-  for (const slots of draft.edits.values())
-    for (const [binding, occ] of slots)
-      if (occ?.kind === 'instance') collectClaimRelease(binding, occ, releases);
+function collectDraftReleases(draft, releases, seen = new Set()) {
+  if (!draft || seen.has(draft)) return;
+  seen.add(draft);
+  if (draft.edits) {
+    for (const slots of draft.edits.values())
+      for (const [binding, occ] of slots)
+        if (occ?.kind === 'instance') collectClaimRelease(binding, occ, releases, seen);
+  }
+  if (draft.ownedBodies) {
+    for (const body of draft.ownedBodies) {
+      if (body.anchor || body.placedIn) continue; // committed elsewhere: borrowed, not owned by this draft
+      if (body.staged && !body.staged.sealed) {
+        const sub = body.staged;
+        body.staged = null;
+        collectDraftReleases(sub, releases, seen);
+      }
+    }
+  }
 }
 
 function runReleases(releases, errors) {
@@ -410,7 +424,7 @@ function runReleases(releases, errors) {
 
 function throwErrors(errors) {
   if (errors.length === 1) throw errors[0];
-  if (errors.length > 1) throw new AggregateError(errors, 'temtie/core: multiple release errors');
+  if (errors.length > 1) throw new AggregateError(errors, 'temtie/core: multiple errors during cleanup');
 }
 
 function drainReleases(releases, errors = []) {
@@ -469,9 +483,10 @@ function resolveBody(parent, draft, seg, binding, ref, values) {
   if (!binding.dest.container) throw new Error('temtie/core: a spread hole cannot host a target');
 
   const occ = binding.occupant;
-  const child = ref.target
-    ?? (occ?.kind === 'body' && !carried(occ.body, seg, values) && !draft.takenBodies?.has(occ.body) ? occ.body : null)
-    ?? makeTarget(parent.proto);
+  const existing = ref.target
+    ?? (occ?.kind === 'body' && !carried(occ.body, seg, values) && !draft.takenBodies?.has(occ.body) ? occ.body : null);
+  const fresh = !existing;
+  const child = existing ?? makeTarget(parent.proto);
 
   if (reaches(child, parent))
     throw new Error('temtie/core: a target cannot be anchored beneath its descendant');
@@ -479,6 +494,7 @@ function resolveBody(parent, draft, seg, binding, ref, values) {
     ref.target = child;
     Object.setPrototypeOf(ref.inst, child.proto);
   }
+  if (fresh) (draft.ownedBodies ??= new Set()).add(child);
   (draft.takenBodies ??= new Set()).add(child);
   (draft.children ??= new Set()).add(child);
   return child;
@@ -502,18 +518,20 @@ function resolveInstance(parent, draft, binding, raw, init) {
   if (!isNew) {
     claim = existing;
   } else {
-    // run init before storing in draft: a throw leaves zero residue
     claim = {
       kind: 'instance', init, ref: null, body: null, hooks: null,
       alive: true, committed: false, usedHole: false, handle: null,
       binding: null, owner: null, proto: parent.proto,
     };
     claim.ref = makeRef(null, claim);
-    const made = init(claim.ref.inst, ...props);
-    claim.hooks = typeof made === 'function' ? { render: made } : made ?? {};
   }
 
   try {
+    if (isNew) {
+      // init() runs inside try so descendants initialized before a throw still retire
+      const made = init(claim.ref.inst, ...props);
+      claim.hooks = typeof made === 'function' ? { render: made } : made ?? {};
+    }
     claim.hooks.render?.(claim.ref.inst, ...props);
     const body = claim.body ?? activeLazyBody(claim);
     if (body) {
@@ -802,7 +820,7 @@ function claimBodyOwner(body, kind, binding, owner, editEntry, tx) {
   if (prev && prev.binding !== binding) {
     // supersede an earlier claim for this same body within the same commit
     if (prev.kind === 'instance') tx.endedClaims.push({ binding: prev.binding, claim: prev.claim });
-    tx.edits.push({ binding: prev.binding, nextOcc: null, owner: prev.owner, prevBag: null, committedNew: false });
+    tx.edits.push({ binding: prev.binding, nextOcc: null, owner: prev.owner, prevBag: null, entered: false });
     if (tx.flushed.has(body)) evictBody(body, tx);
   }
   tx.bodyOwner.set(body, { kind, binding, owner, editEntry, claim: kind === 'instance' ? editEntry?.nextOcc ?? binding.occupant : null });
@@ -859,7 +877,7 @@ function applyTarget(target, anchor, parent, tx, queue, queuedAnchor) {
 
         if (stagedOcc.kind === 'plain') {
           const nextOcc = binding.dest.write ? { kind: 'plain', prev: stagedOcc.value } : null;
-          tx.edits.push({ binding, nextOcc, owner: target, prevBag, committedNew: false });
+          tx.edits.push({ binding, nextOcc, owner: target, prevBag, entered: false });
           if (cur && cur.kind !== 'plain') {
             vacateDom(binding, cur, tx, 'plain');
             noteLeaving(binding, cur, tx);
@@ -873,7 +891,7 @@ function applyTarget(target, anchor, parent, tx, queue, queuedAnchor) {
           tx.claimedBodies.add(child);
           let editEntry = null;
           if (cur?.kind !== 'body' || cur.body !== child) {
-            editEntry = { binding, nextOcc: { kind: 'body', body: child }, owner: target, prevBag, committedNew: false };
+            editEntry = { binding, nextOcc: { kind: 'body', body: child }, owner: target, prevBag, entered: false };
             tx.edits.push(editEntry);
             if (cur) {
               vacateDom(binding, cur, tx, 'body');
@@ -898,15 +916,16 @@ function applyTarget(target, anchor, parent, tx, queue, queuedAnchor) {
         const claim = stagedOcc, isNew = claim !== cur;
         let editEntry = null;
         if (isNew) {
-          editEntry = { binding, nextOcc: claim, owner: target, prevBag, committedNew: false };
+          editEntry = { binding, nextOcc: claim, owner: target, prevBag, entered: false };
           tx.edits.push(editEntry);
           if (cur) {
             vacateDom(binding, cur, tx, 'instance');
             noteLeaving(binding, cur, tx);
           }
+          // cleanup obligation starts before commit() executes, not after it returns
+          editEntry.entered = true;
         }
         claim.hooks?.commit?.(handleOf(binding, claim));
-        if (editEntry) editEntry.committedNew = true;
         if (claim.hooks?.settle) tx.settles.push(() => claim.hooks.settle(handleOf(binding, claim)));
         const body = claim.body ?? activeLazyBody(claim);
         if (body) {
@@ -974,6 +993,13 @@ function finalizeTx(tx) {
         }
       }
       if (dropped?.length) pruneDropped(target, dropped);
+      if (draft.ownedBodies)
+        for (const body of draft.ownedBodies)
+          if (!tx.claimedBodies.has(body) && !body.anchor && !body.placedIn && body.staged && !body.staged.sealed) {
+            const sub = body.staged;
+            body.staged = null;
+            collectDraftReleases(sub, tx.releases);
+          }
     }
   }
 
@@ -1036,6 +1062,7 @@ function pruneDropped(target, dropped) {
 // restores DOM back to V1 when Phase 1 throws and retires all failed draft-owned claims
 function rollbackTx(tx, cause) {
   const detachedDrafts = [], releases = [];
+  const bestEffort = (fn) => { try { fn(); } catch { /* best-effort */ } };
 
   // 1. Collect detached failed drafts (already detached from target.staged on consume)
   for (let i = tx.touched.length - 1; i >= 0; i--) {
@@ -1046,39 +1073,46 @@ function rollbackTx(tx, cause) {
     }
   }
 
-  // 2. Clear DOM of newly committed V2 claims while their segments are still mounted
+  // 2. Clear DOM of newly entered V2 claims while their segments are still mounted
   for (let i = tx.edits.length - 1; i >= 0; i--) {
-    const { binding, nextOcc, committedNew } = tx.edits[i];
-    if (!committedNew || nextOcc?.kind !== 'instance') continue;
+    const { binding, nextOcc, entered } = tx.edits[i];
+    if (!entered || nextOcc?.kind !== 'instance') continue;
     const h = handleOf(binding, nextOcc);
-    try { nextOcc.hooks?.clear?.(h); } catch { /* best-effort */ }
-    if (binding.end) clearRange(binding);
-    if (nextOcc.usedHole) try { binding.dest.clear?.(binding); } catch { /* best-effort */ }
+    bestEffort(() => nextOcc.hooks?.clear?.(h));
+    if (binding.end) bestEffort(() => clearRange(binding));
+    if (nextOcc.usedHole) bestEffort(() => binding.dest.clear?.(binding));
     collectClaimRelease(binding, nextOcc, releases);
   }
 
   // 3. Park V2-only segments and re-place V1 committed segments & parked bodies
+  const restoreChain = (target, anchor, list) => {
+    let prevEnd = null;
+    for (const seg of list) {
+      bestEffort(() => placeSeg(target, anchor, seg, prevEnd));
+      if (!seg.parked) prevEnd = seg.end;
+    }
+  };
   for (let i = tx.touched.length - 1; i >= 0; i--) {
     const { target, nextList } = tx.touched[i];
     const keep = new Set(target.committed);
-    for (const seg of nextList) if (!keep.has(seg)) parkSeg(seg);
+    for (const seg of nextList) if (!keep.has(seg)) bestEffort(() => parkSeg(seg));
     if (target.placedIn) {
-      placeChain(target, target.placedIn, target.committed);
-      if (target.committed.length) deliver(target, target.placedIn);
+      restoreChain(target, target.placedIn, target.committed);
+      if (target.committed.length) bestEffort(() => deliver(target, target.placedIn));
     }
   }
   for (const body of tx.parkedBodies)
-    if (body.placedIn) placeChain(body, body.placedIn, body.committed);
+    if (body.placedIn) restoreChain(body, body.placedIn, body.committed);
 
   // 4. Restore V1 plain / spread hole values now that V1 segments are back in DOM
   for (let i = tx.edits.length - 1; i >= 0; i--) {
     const { binding, prevBag } = tx.edits[i];
     const prev = binding.occupant;
-    try {
+    bestEffort(() => {
       if (binding.dest.kind === HOLE.SPREAD) writeSpread(binding, prevBag ?? {});
       else if (prev?.kind === 'plain') binding.dest.write?.(binding, prev.prev);
       else if (prev?.kind !== 'instance') binding.dest.clear?.(binding);
-    } catch { /* best-effort */ }
+    });
   }
 
   // 5. Retire all V2 draft-owned claims before re-attaching V1 hole-drivers
@@ -1090,9 +1124,7 @@ function rollbackTx(tx, cause) {
   for (let i = tx.edits.length - 1; i >= 0; i--) {
     const { binding } = tx.edits[i];
     const prev = binding.occupant;
-    if (prev?.kind === 'instance') {
-      try { prev.hooks?.commit?.(handleOf(binding, prev)); } catch { /* best-effort */ }
-    }
+    if (prev?.kind === 'instance') bestEffort(() => prev.hooks?.commit?.(handleOf(binding, prev)));
   }
 
   throwErrors(errors);
