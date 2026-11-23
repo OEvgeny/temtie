@@ -303,7 +303,7 @@ serialize(root); // '<article><h1>Hello &lt;world&gt;</h1></article>'
 
 `temtie/debug.js` is a lightweight event hub that emits structured lifecycle
 events (`mount`, `call`, `stage`, `claim`, `write`, `move`, `drop`, `commit`,
-`flush`, `place`, `sealed`, `settled`, `end`, `dispose`, `compile`, `compiled`,
+`flush`, `place`, `settled`, `end`, `dispose`, `compile`, `compiled`,
 `assert-failed`). When no listener is attached, event objects are not allocated.
 
 ```js

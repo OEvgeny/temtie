@@ -176,7 +176,7 @@ declare module 'temtie' {
     | { type: 'deliver'; target: DebugTarget; binding: DebugBinding }
     | { type: 'move'; target: DebugTarget; segment: DebugSegment; container: unknown; after: unknown }
     | { type: 'drop'; target: DebugTarget; segment: DebugSegment }
-    | { type: 'commit' | 'flush' | 'place' | 'sealed'; target: DebugTarget; pass: number }
+    | { type: 'commit' | 'flush' | 'place'; target: DebugTarget; pass: number }
     | { type: 'settled'; target: DebugTarget }
     | { type: 'dispose'; target: DebugTarget }
     | { type: 'compile'; builder: Builder; target: DebugTarget | null; pass?: number; site: TemplateStringsArray; html: string }
