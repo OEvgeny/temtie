@@ -145,7 +145,9 @@ function dropOpened(root, since) {
   for (let i = 0; i < queue.length; i++) {
     const cur = queue[i];
     for (const child of cur.children) visit(child);
-    if (cur.staged?.children) for (const child of cur.staged.children) visit(child);
+    if (cur.staged?.children)
+      for (const child of cur.staged.children)
+        if (!child.anchor && !(child.ownerClaim?.binding && child.ownerClaim.alive)) visit(child);
     if (cur !== root && cur.staged && cur.staged.pass > since) cur.staged = null;
   }
 }
