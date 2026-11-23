@@ -38,10 +38,10 @@ const commitOf = (spec) => (typeof spec === 'function' ? null : spec.commit);
 const releaseOf = (spec) => (typeof spec === 'function' ? null : spec.release);
 
 /** @type {Mount} */
-export function mount(container, { builders } = {}) {
+export function mount(container, builders) {
   if (!container) throw new Error(`temtie/core: expected container, got ${String(container)}`);
-  if (!builders || typeof builders !== 'object' || !Object.keys(builders).length)
-    throw new Error('temtie/core: mount() requires builders, e.g. mount(el, { builders: { html } })');
+  if (!builders || typeof builders !== 'object' || typeof builders.compile === 'function' || !Object.keys(builders).length)
+    throw new Error('temtie/core: mount() requires builders, e.g. mount(el, { html })');
 
   // a mounted root is a regular target seated in a uniform container host
   const host = { dest: DEST[ROOT], node: container, marker: null, builder: null, occupant: null };

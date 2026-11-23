@@ -126,7 +126,7 @@ declare module 'temtie' {
 
   export type Mount = <Bs extends Builders = DefaultBuilders>(
     container: RenderContainer<Bs>,
-    options: { builders: Bs }
+    builders: Bs
   ) => Instance<Bs>;
   export type Capture = <Bs extends Builders = DefaultBuilders>() => Instance<Bs>;
   export type Commit = (instance: Instance<any>) => void;
