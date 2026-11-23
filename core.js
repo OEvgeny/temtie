@@ -437,15 +437,19 @@ function makeHandle(claim) {
   return handle;
 }
 
-function markKeepSet(nextList, mark) {
+function markKeepSet(nextList, prevMark) {
   const seq = [], segs = [];
+  let prevIdx = -1, ordered = true;
   for (let i = 0; i < nextList.length; i++) {
     const seg = nextList[i];
-    if (!seg.parked) { seq.push(seg.oldIndex); segs.push(seg); }
+    if (seg.parked) continue;
+    if (seg.oldIndex < prevIdx) ordered = false;
+    prevIdx = seg.oldIndex;
+    seq.push(seg.oldIndex);
+    segs.push(seg);
   }
-  const n = seq.length;
-  if (n <= 1) { if (n === 1) segs[0].keepPass = mark; return; }
-  const tails = [], prev = new Int32Array(n);
+  if (ordered) return prevMark;
+  const n = seq.length, mark = ++PASS, tails = [], prev = new Int32Array(n);
   for (let i = 0; i < n; i++) {
     const val = seq[i];
     let lo = 0, hi = tails.length;
@@ -454,6 +458,7 @@ function markKeepSet(nextList, mark) {
     tails[lo] = i;
   }
   for (let k = tails[tails.length - 1]; k >= 0; k = prev[k]) segs[k].keepPass = mark;
+  return mark;
 }
 
 function tryStep(errors, fn) {
@@ -757,11 +762,6 @@ const needsPlace = (target, anchor) =>
   target.anchor !== anchor
   || (target.committed.length > 0 && (target.committed[0].parked !== null || !inPlace(anchor, target.committed[0], null)));
 
-function extractSeg(seg) {
-  if (!seg.parked && seg.builder.parent(seg.start))
-    seg.parked = seg.builder.extract(seg.start, seg.end);
-}
-
 function parkSegs(initial) {
   if (!initial.length) return;
   const segs = initial.slice();
@@ -771,7 +771,11 @@ function parkSegs(initial) {
       if (body) pushAll(segs, body.committed);
     }
   }
-  for (let i = segs.length - 1; i >= 0; i--) extractSeg(segs[i]);
+  for (let i = segs.length - 1; i >= 0; i--) {
+    const seg = segs[i];
+    if (!seg.parked && seg.builder.parent(seg.start))
+      seg.parked = seg.builder.extract(seg.start, seg.end);
+  }
 }
 
 function evictSegs(initial, liveNodes, applied, errors) {
@@ -808,9 +812,10 @@ function vacateBody(body, liveNodes, applied) {
   else evictSegs(body.committed, liveNodes, applied, null);
 }
 
-function placeChain(target, anchor, list) {
+function placeChain(target, anchor, list, keepMark = 0) {
   let prevEnd = null;
   for (const seg of list) {
+    if (keepMark && !seg.parked && seg.keepPass === keepMark) { prevEnd = seg.end; continue; }
     if (seg.parked || !inPlace(anchor, seg, prevEnd)) {
       const builder = seg.builder,
         after = prevEnd ?? anchor.dest.after?.(anchor, builder),
@@ -897,10 +902,15 @@ function vacateBinding(binding, occ, nextKind, liveNodes, applied) {
 }
 
 function reconcileSegments(target, anchor, draft, liveNodes, applied) {
-  let committed = target.committed;
+  const committed = target.committed;
   const nextList = nextListOf(draft, committed);
+  if (nextList === committed) {
+    if (needsPlace(target, anchor)) placeChain(target, anchor, nextList);
+    return committed;
+  }
 
-  if (draft.mode !== 'amend' && nextList !== committed) {
+  let keepMark = 0;
+  if (draft.mode !== 'amend') {
     const mark = ++PASS;
     for (const seg of nextList) seg.keepPass = mark;
     let order = 0, anyDropped = false;
@@ -911,18 +921,11 @@ function reconcileSegments(target, anchor, draft, liveNodes, applied) {
       evictSegs([seg], liveNodes, applied, null);
       pruneSeg(target, seg);
     }
-    if (anyDropped) committed = target.committed = committed.filter((seg) => seg.keepPass === mark);
+    if (anyDropped) target.committed = committed.filter((seg) => seg.keepPass === mark);
+    if (target.anchor === anchor && anchor.dest.after) keepMark = markKeepSet(nextList, mark);
   }
 
-  if (nextList !== committed || needsPlace(target, anchor)) {
-    if (draft.mode !== 'amend' && nextList !== committed && target.anchor === anchor) {
-      const mark = ++PASS;
-      markKeepSet(nextList, mark);
-      // reordered segments keep their hosted child bodies intact and move as one subtree
-      for (const seg of nextList) if (!seg.parked && seg.keepPass !== mark) extractSeg(seg);
-    }
-    placeChain(target, anchor, nextList);
-  }
+  placeChain(target, anchor, nextList, keepMark);
   return nextList;
 }
 
