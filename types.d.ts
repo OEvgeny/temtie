@@ -111,7 +111,7 @@ declare module 'temtie' {
   export type DebugOccupant =
     | { readonly kind: 'plain' }
     | { readonly kind: 'body'; readonly body: DebugTarget }
-    | { readonly kind: 'instance'; readonly body: DebugTarget | null; readonly init: Function };
+    | { readonly kind: 'instance'; readonly body: DebugTarget | null; readonly spec: object | Function };
 
   export interface DebugBinding {
     readonly dest: { readonly kind: 'root' | 'child' | 'attr' | 'meta' | 'spread' };

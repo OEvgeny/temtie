@@ -30,6 +30,10 @@ const carriesIdentity = (key) => key !== undefined && key !== null && key !== tr
 
 const sameOccupant = (a, b) => a === b || (a?.kind === 'body' && b?.kind === 'body' && a.body === b.body);
 
+const stageOf = (spec) => (typeof spec === 'function' ? spec : spec.stage);
+const commitOf = (spec) => (typeof spec === 'function' ? null : spec.commit);
+const releaseOf = (spec) => (typeof spec === 'function' ? null : spec.release);
+
 /** @type {Mount} */
 export function mount(container, { builders } = {}) {
   if (!container) throw new Error(`temtie/core: expected container, got ${String(container)}`);
@@ -375,7 +379,7 @@ function reaches(cur, goal, seen = new Set()) {
   return false;
 }
 
-// Staging records inert data; contract init() and render() run in Commit Pass 1 (Plan).
+// Staging records inert data; contract stage() runs in Commit Pass 1 and commit()/release() in Pass 3.
 function resolveSegment(target, draft, seg, values) {
   let edits = draft.edits;
   const setSlot = (binding, occ) => (edits ??= draft.edits = new Map()).set(binding, occ);
@@ -383,13 +387,13 @@ function resolveSegment(target, draft, seg, values) {
   for (const binding of seg.bindings) {
     const raw = values[binding.slot];
     if (raw !== null && (typeof raw === 'object' || typeof raw === 'function')) {
-      const init = raw[VALUE];
-      if (init !== undefined) {
-        if (typeof init !== 'function')
-          throw new TypeError('temtie/core: a contract value must carry an init function under Symbol.for("temtie.value")');
+      const spec = raw[VALUE];
+      if (spec !== undefined) {
+        if ((typeof spec !== 'object' || spec === null) && typeof spec !== 'function')
+          throw new TypeError('temtie/core: a contract value must carry a descriptor object or function under Symbol.for("temtie.value")');
         if (!binding.dest.container)
           throw new Error('temtie/core: a spread hole cannot host a contract');
-        setSlot(binding, { kind: 'value', init, props: raw.props ?? [] });
+        setSlot(binding, { kind: 'value', spec, raw });
         continue;
       }
       if (raw[PRIVATE]) {
@@ -460,6 +464,7 @@ function makeHandle(binding, claim) {
   const handle = {
     kind: dest.kind, builder: binding.builder, node: binding.node,
     marker: binding.marker, prop: binding.prop ?? null, name: binding.name,
+    get target() { return (claim.ref ??= makeRef(null, claim)).inst; },
   };
   if (dest.write) {
     handle.set = (value) => {
@@ -578,20 +583,24 @@ function collectDisposed(roots, endedClaims) {
 
 function endClaims(list) {
   const releases = [];
-  for (const { binding, claim } of list) {
+  for (const { binding, claim, raw } of list) {
     if (!claim.alive) continue;
     claim.alive = false;
     if (!claim.body && claim.ref?.target?.staged) claim.ref.target.staged = null;
     debug.enabled && debug.emit({ type: 'end', binding, occupant: claim });
-    if (claim.hooks?.release) {
-      const h = handleOf(binding, claim);
-      releases.push(() => claim.hooks.release(h));
-    }
+    const releaseFn = releaseOf(claim.spec);
+    if (!releaseFn) continue;
+    // Only release a claim whose commit() ran (or, if commit-less, whose stage() published)
+    const cur = raw !== undefined ? raw
+      : (commitOf(claim.spec) ? claim.committed : claim.staged);
+    if (cur === UNSET) continue;
+    const h = handleOf(binding, claim);
+    releases.push(() => releaseFn(h, cur));
   }
   return releases;
 }
 
-// Pass 1 (DOM-free): detach drafts, expand contract init()/render(), resolve canonical ownership.
+// Pass 1 (DOM-free): detach drafts, expand pure contract stage(), resolve canonical ownership.
 function planCommit(rootTarget, rootAnchor, rootParent) {
   const makeNode = (target, anchor, parent) => ({
     target, anchor, parent, incomingOcc: null,
@@ -604,9 +613,7 @@ function planCommit(rootTarget, rootAnchor, rootParent) {
     nodes: new Map([[rootTarget, rootNode]]),
     queue: [rootNode],
     finalOwner: new Map([[rootTarget, { node: null, binding: rootAnchor, parent: rootParent }]]),
-    openedClaims: [],
-    commits: [],
-    settles: [],
+    pending: new Map(), // claim → { next, isNew }
   };
 
   const attachChild = (body, binding, parentNode, explicit, incomingOcc) => {
@@ -636,95 +643,106 @@ function planCommit(rootTarget, rootAnchor, rootParent) {
     if (explicit) childNode.incomingOcc = incomingOcc;
   };
 
-  for (let i = 0; i < plan.queue.length; i++) {
-    const node = plan.queue[i], target = node.target;
+  let i = 0;
+  try {
+    for (; i < plan.queue.length; i++) {
+      const node = plan.queue[i], target = node.target;
 
-    if (target.staged?.sealed) { node.sealed = true; continue; }
-    if (!target.staged) {
-      for (const child of target.children) attachChild(child, child.anchor, node, false, null);
-      continue;
-    }
-
-    // detach before any user hook runs: reentrant recording starts a separate draft
-    const draft = target.staged, committed = target.committed;
-    target.staged = null;
-    node.draft = draft;
-
-    const nextList = draft.mode === 'amend'
-      ? (draft.list ? (draft.base === committed ? draft.list : committed.concat(draft.created ?? [])) : committed)
-      : (draft.list ?? (draft.base === committed && draft.matched === committed.length
-        ? committed
-        : draft.base.slice(0, draft.matched)));
-    node.nextList = nextList;
-
-    const touchedBindings = target.children.size ? new Set() : null;
-    if (nextList !== committed) {
-      const nextSet = draft.mode === 'amend' ? new Set(nextList) : null;
-      const dropped = [];
-      for (const seg of committed) {
-        if (nextSet ? nextSet.has(seg) : seg.seenPass === draft.pass) continue;
-        dropped.push(seg);
-        if (touchedBindings) for (const binding of seg.bindings) touchedBindings.add(binding);
+      if (target.staged?.sealed) { node.sealed = true; continue; }
+      if (!target.staged) {
+        for (const child of target.children) attachChild(child, child.anchor, node, false, null);
+        continue;
       }
-      if (dropped.length) node.dropped = dropped;
-    }
 
-    if (draft.edits) {
-      const liveSegs = draft.mode === 'amend' && draft.base !== committed ? new Set(nextList) : null;
-      const edits = node.edits = draft.edits;
-      for (const [binding, stagedOcc] of edits) {
-        if (!stagedOcc) continue;
-        if (liveSegs && !liveSegs.has(binding.seg)) { edits.delete(binding); continue; }
-        touchedBindings?.add(binding);
-        if (stagedOcc.kind === 'plain') {
-          if (!binding.dest.write) edits.set(binding, null);
-          continue;
+      // detach before any user hook runs: reentrant recording starts a separate draft
+      const draft = target.staged, committed = target.committed;
+      target.staged = null;
+      node.draft = draft;
+
+      const nextList = draft.mode === 'amend'
+        ? (draft.list ? (draft.base === committed ? draft.list : committed.concat(draft.created ?? [])) : committed)
+        : (draft.list ?? (draft.base === committed && draft.matched === committed.length
+          ? committed
+          : draft.base.slice(0, draft.matched)));
+      node.nextList = nextList;
+
+      const touchedBindings = target.children.size ? new Set() : null;
+      if (nextList !== committed) {
+        const nextSet = draft.mode === 'amend' ? new Set(nextList) : null;
+        const dropped = [];
+        for (const seg of committed) {
+          if (nextSet ? nextSet.has(seg) : seg.seenPass === draft.pass) continue;
+          dropped.push(seg);
+          if (touchedBindings) for (const binding of seg.bindings) touchedBindings.add(binding);
         }
-        if (stagedOcc.kind === 'body') {
-          // child-owning edits publish atomically when their childNode applies
-          edits.delete(binding);
-          attachChild(stagedOcc.body, binding, node, true, stagedOcc);
-          continue;
-        }
-        // stagedOcc.kind === 'value'
-        const { init, props } = stagedOcc, cur = binding.occupant;
-        const isNew = !(cur?.kind === 'instance' && cur.init === init && cur.alive);
-        let claim = cur;
-        if (isNew) {
-          claim = {
-            kind: 'instance', init, ref: null, body: null, hooks: null,
-            alive: true, usedHole: false, handle: null,
+        if (dropped.length) node.dropped = dropped;
+      }
+
+      if (draft.edits) {
+        const liveSegs = draft.mode === 'amend' && draft.base !== committed ? new Set(nextList) : null;
+        const edits = node.edits = draft.edits;
+        for (const [binding, stagedOcc] of edits) {
+          if (!stagedOcc) continue;
+          if (liveSegs && !liveSegs.has(binding.seg)) { edits.delete(binding); continue; }
+          touchedBindings?.add(binding);
+          if (stagedOcc.kind === 'plain') {
+            if (!binding.dest.write) edits.set(binding, null);
+            continue;
+          }
+          if (stagedOcc.kind === 'body') {
+            // child-owning edits publish atomically when their childNode applies
+            edits.delete(binding);
+            attachChild(stagedOcc.body, binding, node, true, stagedOcc);
+            continue;
+          }
+          // stagedOcc.kind === 'value'
+          const { spec, raw } = stagedOcc, cur = binding.occupant;
+          const isNew = !(cur?.kind === 'instance' && cur.spec === spec && cur.alive);
+          const claim = isNew ? {
+            kind: 'instance', spec, staged: UNSET, committed: UNSET,
+            ref: null, body: null, alive: true, usedHole: false, handle: null,
             binding: null, owner: null, proto: target.proto,
-          };
-          claim.ref = makeRef(null, claim);
-          const made = init(claim.ref.inst, ...props);
-          claim.hooks = typeof made === 'function' ? { render: made } : made ?? {};
-          plan.openedClaims.push({ binding, claim });
-        }
-        claim.hooks.render?.(claim.ref.inst, ...props);
-        if (claim.hooks?.commit) plan.commits.push({ binding, claim, isNew });
-        if (claim.hooks?.settle) plan.settles.push({ binding, claim });
-        const body = claim.body ?? activeLazyBody(claim);
-        if (body) {
-          edits.delete(binding);
-          attachChild(body, binding, node, true, claim);
-        } else {
-          edits.set(binding, claim);
+          } : cur;
+          const stageFn = stageOf(spec);
+          if (stageFn) {
+            const ref = claim.ref ??= makeRef(null, claim);
+            try {
+              stageFn(ref.inst, claim.staged === UNSET ? undefined : claim.staged, raw);
+            } catch (error) {
+              if (ref.target?.staged) ref.target.staged = null;
+              throw error;
+            }
+          }
+          plan.pending.set(claim, { next: raw, isNew });
+          const body = claim.body ?? activeLazyBody(claim);
+          if (body) {
+            edits.delete(binding);
+            attachChild(body, binding, node, true, claim);
+          } else {
+            edits.set(binding, claim);
+          }
         }
       }
+
+      if (touchedBindings)
+        for (const child of target.children)
+          if (!touchedBindings.has(child.anchor)) attachChild(child, child.anchor, node, false, null);
     }
 
-    if (touchedBindings)
-      for (const child of target.children)
-        if (!touchedBindings.has(child.anchor)) attachChild(child, child.anchor, node, false, null);
-  }
+    for (const [body, { parent }] of plan.finalOwner) {
+      const parentNode = parent && plan.nodes.get(parent);
+      if (parentNode) (parentNode.children ??= []).push(plan.nodes.get(body));
+    }
 
-  for (const [body, { parent }] of plan.finalOwner) {
-    const parentNode = parent && plan.nodes.get(parent);
-    if (parentNode) (parentNode.children ??= []).push(plan.nodes.get(body));
+    return plan;
+  } catch (error) {
+    // Discard drafts queued during this aborted Plan; zero DOM or claim state was mutated
+    for (let j = i + 1; j < plan.queue.length; j++) {
+      const t = plan.queue[j].target;
+      if (t.staged && !t.staged.sealed) t.staged = null;
+    }
+    throw error;
   }
-
-  return plan;
 }
 
 function finishApply(plan, applied, failed = false) {
@@ -737,18 +755,8 @@ function finishApply(plan, applied, failed = false) {
       if (!node.placed && node.draft) voidOpened(node.target, node.draft.pass);
     }
   }
-
-  const uninstalled = [];
-  for (let i = plan.openedClaims.length - 1; i >= 0; i--) {
-    const entry = plan.openedClaims[i];
-    if (entry.claim.binding !== entry.binding || entry.binding.occupant !== entry.claim)
-      uninstalled.push(entry);
-  }
-
   const disposed = collectDisposed(applied.leavingBodies, applied.endedClaims);
-  const releases = endClaims(uninstalled);
-  for (const run of clearDisposed(disposed, EMPTY_PLAN, applied.endedClaims)) releases.push(run);
-  return releases;
+  return clearDisposed(disposed, EMPTY_PLAN, applied.endedClaims);
 }
 
 function commitTarget(rootTarget) {
@@ -769,12 +777,12 @@ function commitTarget(rootTarget) {
   });
 
   withCause(ev, () => {
-    const applied = { leavingBodies: [], endedClaims: [] };
-    let plan, releases;
+    const applied = { leavingBodies: [], endedClaims: [], commits: [] };
+    let releases;
     PHASE = PLAN;
     try {
       // Pass 1: Plan (DOM-free)
-      plan = planCommit(rootTarget, rootAnchor, rootParent);
+      const plan = planCommit(rootTarget, rootAnchor, rootParent);
       // Pass 2: Apply (pure builder mutations + publication; no user contract hooks)
       PHASE = APPLY;
       try {
@@ -790,32 +798,28 @@ function commitTarget(rootTarget) {
       PHASE = IDLE;
     }
 
-    // Pass 3: Effects — Core is settled; release departing claims before arriving commits & settles
+    // Pass 3: Effects — Core is settled; release departing claims before post-order arriving commits
     const errors = [];
     runAll(releases, errors);
 
-    for (const { binding, claim, isNew } of plan.commits) {
+    for (const { binding, claim, commitFn, next, isNew } of applied.commits) {
       if (!claim.alive) continue;
+      const prev = claim.committed === UNSET ? undefined : claim.committed;
       try {
-        claim.hooks.commit(handleOf(binding, claim));
+        commitFn(handleOf(binding, claim), prev, next);
+        claim.committed = next;
       } catch (error) {
         errors.push(error);
         if (isNew && binding.occupant === claim) {
           if (binding.end) try { clearRange(binding); } catch {}
           if (claim.usedHole) try { binding.dest.clear?.(binding); } catch {}
           binding.occupant = null;
-          const ended = [{ binding, claim }];
+          const ended = [{ binding, claim, raw: next }];
           const disposed = claim.body ? collectDisposed([claim.body], ended) : [];
           claim.body = null;
           runAll(clearDisposed(disposed, EMPTY_PLAN, ended), errors);
         }
       }
-    }
-
-    for (const { binding, claim } of plan.settles) {
-      if (!claim.alive) continue;
-      try { claim.hooks.settle(handleOf(binding, claim)); }
-      catch (error) { errors.push(error); }
     }
 
     debug.enabled && ev && debug.emit({ type: 'settled', target: rootTarget });
@@ -889,41 +893,49 @@ function deliver(target, anchor) {
   anchor.dest.deliver(anchor);
 }
 
-function bindTarget(target, anchor, parent, incomingOcc = null) {
+function bindTarget(target, anchor, parent, incomingOcc = null, plan = null) {
   if (target.parent && target.parent !== parent) target.parent.children.delete(target);
   target.anchor = target.placedIn = anchor;
   target.parent = parent;
   anchor.placedBody = target;
   parent?.children.add(target);
-  if (incomingOcc && !sameOccupant(anchor.occupant, incomingOcc)) {
-    anchor.occupant = incomingOcc;
-    if (incomingOcc.kind === 'instance') {
-      incomingOcc.binding = anchor;
-      incomingOcc.owner = parent;
+  if (incomingOcc) {
+    if (!sameOccupant(anchor.occupant, incomingOcc)) {
+      anchor.occupant = incomingOcc;
+      if (incomingOcc.kind === 'instance') {
+        incomingOcc.binding = anchor;
+        incomingOcc.owner = parent;
+        incomingOcc.body = target;
+      }
+      debug.enabled && debug.emit({ type: 'claim', binding: anchor, occupant: incomingOcc });
+    } else if (incomingOcc.kind === 'instance') {
       incomingOcc.body = target;
     }
-    debug.enabled && debug.emit({ type: 'claim', binding: anchor, occupant: incomingOcc });
+    if (incomingOcc.kind === 'instance') {
+      const pending = plan?.pending.get(incomingOcc);
+      if (pending) incomingOcc.staged = pending.next;
+    }
   } else if (target.ownerClaim && target.ownerClaim.binding === anchor) {
     target.ownerClaim.body = target;
   }
 }
 
-function placeTarget(target, anchor, parent, incomingOcc = null) {
+function placeTarget(target, anchor, parent, incomingOcc = null, plan = null) {
   if (needsPlace(target, anchor)) {
     settleSpan(target, 'place', 0, () => {
       placeChain(target, anchor, target.committed);
       if (target.committed.length) deliver(target, anchor);
     });
   }
-  bindTarget(target, anchor, parent, incomingOcc);
+  bindTarget(target, anchor, parent, incomingOcc, plan);
 }
 
 function placeSubtree(target, anchor, parent, plan, incomingOcc = null) {
   if (!needsPlace(target, anchor)) {
-    bindTarget(target, anchor, parent, incomingOcc);
+    bindTarget(target, anchor, parent, incomingOcc, plan);
     return;
   }
-  placeTarget(target, anchor, parent, incomingOcc);
+  placeTarget(target, anchor, parent, incomingOcc, plan);
   for (const child of target.children) {
     const owner = plan.finalOwner.get(child);
     if (!owner || owner.parent === target) placeSubtree(child, child.anchor, target, plan);
@@ -961,6 +973,13 @@ function detachHost(host, target, applied) {
   host.dest.vacate?.(host);
 }
 
+function queueCommit(binding, claim, plan, applied) {
+  const pending = plan.pending.get(claim);
+  if (!pending) return;
+  const commitFn = commitOf(claim.spec);
+  if (commitFn) applied.commits.push({ binding, claim, commitFn, next: pending.next, isNew: pending.isNew });
+}
+
 function applyNode(node, plan, applied) {
   const { target, anchor, parent, incomingOcc, draft, nextList, dropped, edits } = node;
 
@@ -978,12 +997,13 @@ function applyNode(node, plan, applied) {
   if (node.sealed) {
     placeSubtree(target, anchor, parent, plan, incomingOcc);
     node.placed = true;
+    if (incomingOcc?.kind === 'instance') queueCommit(anchor, incomingOcc, plan, applied);
     debug.enabled && debug.emit({ type: 'sealed', target, pass: target.staged.pass });
     return;
   }
 
   if (!draft) {
-    placeTarget(target, anchor, parent, incomingOcc);
+    placeTarget(target, anchor, parent, incomingOcc, plan);
     node.placed = true;
   } else {
     settleSpan(target, 'flush', draft.pass, () => {
@@ -1010,7 +1030,7 @@ function applyNode(node, plan, applied) {
         placeChain(target, anchor, nextList);
       }
 
-      bindTarget(target, anchor, parent, incomingOcc);
+      bindTarget(target, anchor, parent, incomingOcc, plan);
       target.committed = nextList;
       node.placed = true;
       if (draft.created) {
@@ -1058,6 +1078,9 @@ function applyNode(node, plan, applied) {
               claim.owner = target;
               debug.enabled && debug.emit({ type: 'claim', binding, occupant: claim });
             }
+            const pending = plan.pending.get(claim);
+            if (pending) claim.staged = pending.next;
+            queueCommit(binding, claim, plan, applied);
           }
         }
       }
@@ -1067,6 +1090,9 @@ function applyNode(node, plan, applied) {
   }
 
   if (node.children) for (const child of node.children) applyNode(child, plan, applied);
+
+  // Post-order: body-owning claim's commit() runs after all its own edits and child commits
+  if (incomingOcc?.kind === 'instance') queueCommit(anchor, incomingOcc, plan, applied);
 }
 
 function clearDisposed(bodies, plan, endedClaims) {
