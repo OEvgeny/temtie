@@ -180,6 +180,24 @@ function isDroppedInPlan(target, seg) {
   return !!draft && draft.mode !== 'amend' && !nextListOf(draft, target.committed).includes(seg);
 }
 
+function isLeavingInPlan(parent, binding, body) {
+  const pEdits = PLAN_NODES.get(parent)?.draft?.edits;
+  if (pEdits) {
+    if (pEdits.has(binding)) {
+      const entry = pEdits.get(binding);
+      if (entry?.[STAGED] !== 'body' || entry.body !== body) return true;
+    }
+    for (const [b, entry] of pEdits)
+      if (b !== binding && entry?.[STAGED] === 'body' && entry.body === body) return true;
+  }
+  const bNode = PLAN_NODES.get(body);
+  if (bNode && bNode.anchor !== binding) return true;
+  for (const node of PLAN_NODES.values())
+    if (node.target !== parent && (node.draft?.children?.has(body) || node.target.staged?.children?.has(body)))
+      return true;
+  return false;
+}
+
 function makeChannel(builder) {
   return function channel(strings, ...values) {
     const target = refTarget(this[PRIVATE], true);
@@ -369,7 +387,8 @@ function resolveBody(parent, draft, seg, binding, ref, values) {
 
   const occ = binding.occupant;
   const child = refTarget(ref, !!ref.claim)
-    ?? (occ?.kind === 'body' && !carried(occ.body, seg, values) && !draft.children?.has(occ.body) ? occ.body : null)
+    ?? (occ?.kind === 'body' && !carried(occ.body, seg, values) && !draft.children?.has(occ.body)
+      && (!PLAN_NODES || !isLeavingInPlan(parent, binding, occ.body)) ? occ.body : null)
     ?? makeTarget(parent.proto);
 
   if (ref.target !== child) {
@@ -649,7 +668,7 @@ function planCommit(rootTarget, rootAnchor, rootParent) {
 
       const liveSegs = draft.mode === 'amend' && draft.base !== target.committed
         ? new Set(target.committed.concat(draft.created ?? [])) : null;
-      const edits = node.edits = draft.edits;
+      const edits = node.edits = new Map(draft.edits);
       for (const [binding, entry] of edits) {
         if (liveSegs && !liveSegs.has(binding.seg)) { edits.delete(binding); continue; }
         checkReentry(ACTIVE_CLAIMS.size && ACTIVE_CLAIMS.has(binding.occupant));
