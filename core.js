@@ -507,16 +507,24 @@ function noteLeaving(occ, applied) {
   if (occ.kind === 'body') applied.leaving.push(occ.body);
   else if (occ.kind === 'instance') {
     applied.ended.push(occ);
-    if (occ.body) applied.leaving.push(occ.body);
+    const body = occ.body ?? occ.ref?.target;
+    if (body) applied.leaving.push(body);
   }
 }
 
-function isLiveBody(body) {
+function isLiveBody(body, stop = null) {
   for (let cur = body; cur; cur = cur.parent) {
     if (!cur.anchor || cur.anchor.occupant?.body !== cur) return false;
-    if (cur.anchor.dest.kind === ROOT) return true;
+    if (cur === stop || (!stop && cur.anchor.dest.kind === ROOT)) return true;
   }
   return false;
+}
+
+function liveOwner(target, parent, fallback) {
+  if (isLiveBody(target, fallback)) return target;
+  for (let cur = parent; cur; cur = cur.parent)
+    if (isLiveBody(cur, fallback)) return cur;
+  return fallback;
 }
 
 const nextListOf = (draft, committed) => (draft.mode === 'amend'
@@ -533,8 +541,9 @@ function disposeBodies(roots, endedClaims, errors, owner = null, tried = null) {
       if (!body || disposed.has(body) || isLiveBody(body)) continue;
       disposed.add(body);
       debug.enabled && debug.emit({ type: 'dispose', target: body });
-      if (body.pending) { evictSegs(body.pending, owner, null, sink, errors); body.pending = null; }
-      evictSegs(body.committed, owner, null, sink, errors);
+      const pendingOwner = liveOwner(body, body.parent ?? body.ownerClaim?.owner, owner);
+      if (body.pending) { evictSegs(body.pending, pendingOwner, null, sink, errors); body.pending = null; }
+      evictSegs(body.committed, pendingOwner, null, sink, errors);
       if (body.anchor?.occupant?.body === body) body.anchor.occupant = null;
       body.parent?.children.delete(body);
       body.committed = [];
@@ -549,7 +558,6 @@ function disposeBodies(roots, endedClaims, errors, owner = null, tried = null) {
   for (const claim of endedClaims) {
     if (!claim.alive) continue;
     claim.alive = false;
-    if (!claim.body && claim.ref?.target?.staged) claim.ref.target.staged = null;
     debug.enabled && debug.emit({ type: 'end', binding: claim.binding, occupant: claim });
     const releaseFn = releaseOf(claim.spec);
     if (!releaseFn) continue;
@@ -683,17 +691,19 @@ function planCommit(rootTarget, rootAnchor, rootParent) {
   }
 }
 
-function recoverApply(queue, errors) {
+function recoverApply(queue, errors, rootTarget, applied) {
   for (const node of queue) {
     if (node.placed || !node.draft) continue;
-    if (node.draft.created)
+    if (node.draft.created) {
+      const owner = liveOwner(node.target, node.parent, rootTarget);
       for (const seg of node.draft.created)
         if (seg.parked === null) {
           const before = errors.length;
           tryStep(errors, () => removeSeg(seg));
           if (errors.length === before) seg.parked = UNSET;
-          else queuePending(node.target, seg);
+          else { (applied.tried ??= new Set()).add(seg); queuePending(owner, seg); }
         }
+    }
     voidOpened(node.target, node.draft.pass);
   }
 }
@@ -719,7 +729,7 @@ function runCommits(commits, errors) {
     if (claim.usedHole) tryStep(errors, () => binding.dest.clear?.(binding));
     binding.occupant = null;
     claim.committed = next;
-    const body = claim.body;
+    const body = claim.body ?? claim.ref?.target;
     claim.body = null;
     runAll(disposeBodies(body ? [body] : [], [claim], errors, claim.owner), errors);
   }
@@ -754,7 +764,7 @@ function commitTarget(rootTarget) {
     } catch (error) {
       if (!plan) throw error;
       errors.push(error);
-      recoverApply(plan.queue, errors);
+      recoverApply(plan.queue, errors, rootTarget, applied);
     } finally {
       if (plan) releases = disposeBodies(applied.leaving, applied.ended, errors, rootTarget, applied.tried);
       PHASE = IDLE;
@@ -804,6 +814,7 @@ function queuePending(owner, seg) {
 }
 
 function finishEvict(seg) {
+  if (seg.parked === UNSET) return;
   for (const binding of seg.bindings) if (binding.end) clearRange(binding);
   if (seg.parked === null) removeSeg(seg);
   seg.parked = UNSET;
@@ -843,7 +854,11 @@ function evictSegs(initial, owner, liveNodes, applied, errors) {
   try {
     for (; i >= 0; i--) {
       const seg = segs[i];
-      if (seg.parked === UNSET || applied.tried?.has(seg)) continue;
+      if (seg.parked === UNSET) continue;
+      if (applied.tried?.has(seg)) {
+        if (owner) queuePending(owner, seg);
+        continue;
+      }
       if (errors) {
         const before = errors.length;
         tryStep(errors, () => finishEvict(seg));
