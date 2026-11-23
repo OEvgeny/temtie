@@ -133,24 +133,23 @@ function beginDraft(target, mode, via) {
     mode, pass: ++PASS, base: target.committed,
     sealed: false, voided: false, matched: 0,
     list: null, edits: null, used: null, created: null, createdKeys: null,
-    children: null, takenBodies: null,
+    children: null,
   };
   debug.enabled && debug.emit({ type: 'call', target, pass: draft.pass, via });
   return draft;
 }
 
 function voidOpened(root, since) {
-  const seen = new Set([root]), stack = [root];
-  while (stack.length) {
-    const target = stack.pop();
-    const visit = (child) => {
-      if (seen.has(child)) return;
-      seen.add(child);
-      if (child.staged && !child.staged.sealed && child.staged.pass > since) child.staged.voided = true;
-      stack.push(child);
-    };
-    for (const child of target.children) visit(child);
-    if (target.staged?.children) for (const child of target.staged.children) visit(child);
+  const seen = new Set([root]), queue = [root];
+  const visit = (child) => {
+    if (seen.has(child)) return;
+    seen.add(child);
+    if (child.staged && !child.staged.sealed && child.staged.pass > since) child.staged.voided = true;
+    queue.push(child);
+  };
+  for (let i = 0; i < queue.length; i++) {
+    for (const child of queue[i].children) visit(child);
+    if (queue[i].staged?.children) for (const child of queue[i].staged.children) visit(child);
   }
 }
 
@@ -324,23 +323,6 @@ const DEST = {
 const carried = (body, seg, values) =>
   seg.bindings.some((binding) => values[binding.slot]?.[PRIVATE]?.target === body);
 
-function reaches(start, goal) {
-  if (start === goal) return true;
-  const seen = new Set([start]), stack = [start];
-  while (stack.length) {
-    const cur = stack.pop();
-    const staged = cur.staged, active = staged && !staged.sealed;
-    const push = (child) => {
-      if (child === goal) return true;
-      if (!seen.has(child)) { seen.add(child); stack.push(child); }
-      return false;
-    };
-    if (active && staged.children) for (const child of staged.children) if (push(child)) return true;
-    if (!active || staged.mode === 'amend') for (const child of cur.children) if (push(child)) return true;
-  }
-  return false;
-}
-
 // Staging records inert data; contract stage() runs in Commit Pass 1 and commit()/release() in Pass 3.
 function resolveSegment(target, draft, seg, values) {
   let edits = draft.edits;
@@ -378,16 +360,13 @@ function resolveBody(parent, draft, seg, binding, ref, values) {
 
   const occ = binding.occupant;
   const child = refTarget(ref, !!ref.claim)
-    ?? (occ?.kind === 'body' && !carried(occ.body, seg, values) && !draft.takenBodies?.has(occ.body) ? occ.body : null)
+    ?? (occ?.kind === 'body' && !carried(occ.body, seg, values) && !draft.children?.has(occ.body) ? occ.body : null)
     ?? makeTarget(parent.proto);
 
-  if (reaches(child, parent))
-    throw new Error('temtie/core: a target cannot be anchored beneath its descendant');
   if (ref.target !== child) {
     ref.target = child;
     Object.setPrototypeOf(ref.inst, child.proto);
   }
-  (draft.takenBodies ??= new Set()).add(child);
   (draft.children ??= new Set()).add(child);
   return child;
 }
@@ -458,15 +437,12 @@ function makeHandle(claim) {
   return handle;
 }
 
-function markKeepSet(nextList, committed, mark) {
-  for (let i = 0; i < committed.length; i++) committed[i].oldIndex = i;
+function markKeepSet(nextList, mark) {
   const seq = [], segs = [];
   for (let i = 0; i < nextList.length; i++) {
     const seg = nextList[i];
-    if (!seg.parked && seg.oldIndex >= 0) { seq.push(seg.oldIndex); segs.push(seg); }
+    if (!seg.parked) { seq.push(seg.oldIndex); segs.push(seg); }
   }
-  for (let i = 0; i < committed.length; i++) committed[i].oldIndex = -1;
-
   const n = seq.length;
   if (n <= 1) { if (n === 1) segs[0].keepPass = mark; return; }
   const tails = [], prev = new Int32Array(n);
@@ -481,13 +457,15 @@ function markKeepSet(nextList, committed, mark) {
 }
 
 function tryStep(errors, fn) {
-  try { fn(); return true; }
-  catch (error) { errors?.push(error); return false; }
+  try { fn(); }
+  catch (error) { errors.push(error); }
 }
 
 function runAll(fns, errors) {
   if (fns) for (const run of fns) tryStep(errors, run);
 }
+
+const pushAll = (dst, src) => { for (const item of src) dst.push(item); };
 
 const removeSeg = (seg) => {
   if (seg.builder.parent(seg.start)) seg.builder.remove(seg.start, seg.end);
@@ -539,22 +517,7 @@ function disposeBodies(roots, endedClaims, errors) {
       if (!body || disposed.has(body) || isLiveBody(body)) continue;
       disposed.add(body);
       debug.enabled && debug.emit({ type: 'dispose', target: body });
-      for (const seg of body.committed) {
-        for (const binding of seg.bindings) {
-          if (binding.end) {
-            tryStep(errors, () => clearRange(binding));
-            binding.end = null;
-          }
-          const occ = binding.occupant;
-          if (occ) {
-            binding.occupant = null;
-            noteLeaving(occ, sink);
-          }
-        }
-        const live = seg.parked === null;
-        seg.parked = UNSET;
-        if (live) tryStep(errors, () => removeSeg(seg));
-      }
+      evictSegs(body.committed, null, sink, errors);
       if (body.anchor?.occupant?.body === body) body.anchor.occupant = null;
       body.parent?.children.delete(body);
       body.committed = [];
@@ -584,11 +547,39 @@ const checkReentry = (bad) => {
   if (bad) throw new Error('temtie/core: cannot re-enter an active contract claim during commit');
 };
 
+function assertNoReentry(nodes) {
+  for (const claim of ACTIVE_CLAIMS) {
+    const bodyNode = claim.body && nodes.get(claim.body);
+    checkReentry(bodyNode && bodyNode.anchor !== claim.binding);
+    const ownerNode = nodes.get(claim.owner);
+    if (ownerNode) {
+      checkReentry(ownerNode.draft && ownerNode.draft.mode !== 'amend'
+        && !nextListOf(ownerNode.draft, claim.owner.committed).includes(claim.binding.seg));
+      continue;
+    }
+    for (let p = claim.owner.parent; p; p = p.parent) {
+      const pNode = nodes.get(p);
+      if (pNode) { checkReentry(!pNode.sealed); break; }
+    }
+  }
+}
+
+function claimFor(target, binding, spec, raw) {
+  const cur = binding.occupant;
+  const claim = cur?.kind === 'instance' && cur.spec === spec && cur.alive ? cur : {
+    kind: 'instance', spec, staged: UNSET, committed: UNSET, next: raw,
+    ref: null, body: null, alive: true, usedHole: false, handle: null,
+    binding: null, owner: target,
+  };
+  claim.next = raw;
+  return claim;
+}
+
 // Pass 1 (DOM-free): detach drafts, expand pure contract stage(), resolve canonical ownership.
 function planCommit(rootTarget, rootAnchor, rootParent) {
   const makeNode = (target, anchor, parent) => ({
     target, anchor, parent, ownerNode: null, incomingOcc: null,
-    draft: null, sealed: false, edits: null, children: null, placed: false,
+    draft: null, sealed: false, edits: null, claims: null, children: null, placed: false,
   });
   const rootNode = makeNode(rootTarget, rootAnchor, rootParent);
   const nodes = new Map([[rootTarget, rootNode]]);
@@ -623,82 +614,45 @@ function planCommit(rootTarget, rootAnchor, rootParent) {
   try {
     for (; i < queue.length; i++) {
       const node = queue[i], target = node.target;
-
       if (target.staged?.sealed) { node.sealed = true; continue; }
-      if (!target.staged) {
-        for (const child of target.children) attachChild(child, child.anchor, node, null);
-        continue;
-      }
 
       // detach before any user hook runs: reentrant recording starts a separate draft
       const draft = target.staged;
-      target.staged = null;
-      node.draft = draft;
-
+      if (draft) { target.staged = null; node.draft = draft; }
       for (const child of target.children)
-        if ((draft.mode === 'amend' || child.anchor.seg.seenPass === draft.pass) && !draft.edits?.has(child.anchor))
+        if (!draft || ((draft.mode === 'amend' || child.anchor.seg.seenPass === draft.pass) && !draft.edits?.has(child.anchor)))
           attachChild(child, child.anchor, node, null);
+      if (!draft?.edits) continue;
 
-      if (draft.edits) {
-        const liveSegs = draft.mode === 'amend' && draft.base !== target.committed
-          ? new Set(target.committed.concat(draft.created ?? [])) : null;
-        const edits = node.edits = draft.edits;
-        for (const [binding, entry] of edits) {
-          if (liveSegs && !liveSegs.has(binding.seg)) { edits.delete(binding); continue; }
-          checkReentry(ACTIVE_CLAIMS.size && ACTIVE_CLAIMS.has(binding.occupant));
-          const tag = entry?.[STAGED];
-          if (!tag) continue;
-          if (tag === 'body') {
-            edits.delete(binding);
-            attachChild(entry.body, binding, node, entry);
-            continue;
-          }
-          const { spec, raw } = entry, cur = binding.occupant;
-          const claim = cur?.kind === 'instance' && cur.spec === spec && cur.alive ? cur : {
-            [STAGED]: 'instance', kind: 'instance', spec, staged: UNSET, committed: UNSET, next: raw,
-            ref: null, body: null, alive: true, usedHole: false, handle: null,
-            binding: null, owner: target,
-          };
-          claim.next = raw;
-          const stageFn = stageOf(spec);
-          if (stageFn) {
-            const ref = stagingRef = claim.ref ??= makeRef(null, claim);
-            stageFn(ref.inst, claim.staged === UNSET ? undefined : claim.staged, raw);
-            stagingRef = null;
-          }
-          const body = claim.body ?? activeLazyBody(claim);
-          if (body) {
-            edits.delete(binding);
-            attachChild(body, binding, node, claim);
-          } else {
-            edits.set(binding, claim);
-          }
+      const liveSegs = draft.mode === 'amend' && draft.base !== target.committed
+        ? new Set(target.committed.concat(draft.created ?? [])) : null;
+      const edits = node.edits = draft.edits;
+      for (const [binding, entry] of edits) {
+        if (liveSegs && !liveSegs.has(binding.seg)) { edits.delete(binding); continue; }
+        checkReentry(ACTIVE_CLAIMS.size && ACTIVE_CLAIMS.has(binding.occupant));
+        const tag = entry?.[STAGED];
+        if (!tag) continue;
+        edits.delete(binding);
+        if (tag === 'body') { attachChild(entry.body, binding, node, entry); continue; }
+
+        const claim = claimFor(target, binding, entry.spec, entry.raw);
+        const stageFn = stageOf(entry.spec);
+        if (stageFn) {
+          const ref = stagingRef = claim.ref ??= makeRef(null, claim);
+          stageFn(ref.inst, claim.staged === UNSET ? undefined : claim.staged, entry.raw);
+          stagingRef = null;
         }
+        const body = claim.body ?? activeLazyBody(claim);
+        if (body) attachChild(body, binding, node, claim);
+        else (node.claims ??= []).push([binding, claim]);
       }
     }
 
-    if (ACTIVE_CLAIMS.size) {
-      for (const claim of ACTIVE_CLAIMS) {
-        const bodyNode = claim.body && nodes.get(claim.body);
-        checkReentry(bodyNode && bodyNode.anchor !== claim.binding);
-        const ownerNode = nodes.get(claim.owner);
-        if (ownerNode) {
-          checkReentry(ownerNode.draft && ownerNode.draft.mode !== 'amend'
-            && !nextListOf(ownerNode.draft, claim.owner.committed).includes(claim.binding.seg));
-        } else {
-          for (let p = claim.owner.parent; p; p = p.parent) {
-            const pNode = nodes.get(p);
-            if (pNode) { checkReentry(!pNode.sealed); break; }
-          }
-        }
-      }
-    }
-
+    if (ACTIVE_CLAIMS.size) assertNoReentry(nodes);
     for (let k = 1; k < queue.length; k++) {
       const node = queue[k], parentNode = node.parent && nodes.get(node.parent);
       if (parentNode) (parentNode.children ??= []).push(node);
     }
-
     return { rootNode, nodes, queue };
   } finally {
     if (stagingRef?.target?.staged) stagingRef.target.staged = null;
@@ -706,6 +660,43 @@ function planCommit(rootTarget, rootAnchor, rootParent) {
       const t = queue[j].target;
       if (t.staged && !t.staged.sealed) t.staged = null;
     }
+  }
+}
+
+function recoverApply(queue, errors) {
+  for (const node of queue) {
+    if (node.placed || !node.draft) continue;
+    if (node.draft.created)
+      for (const seg of node.draft.created)
+        if (!seg.parked) tryStep(errors, () => removeSeg(seg));
+    voidOpened(node.target, node.draft.pass);
+  }
+}
+
+function runCommits(commits, errors) {
+  for (const { claim, next, isNew } of commits) {
+    if (!claim.alive) continue;
+    const prev = claim.committed === UNSET ? undefined : claim.committed;
+    let ok = false;
+    ACTIVE_CLAIMS.add(claim);
+    try {
+      claim.spec.commit(handleOf(claim), prev, next);
+      claim.committed = next;
+      ok = true;
+    } catch (error) {
+      errors.push(error);
+    } finally {
+      ACTIVE_CLAIMS.delete(claim);
+    }
+    if (ok || !isNew || claim.binding.occupant !== claim) continue;
+    const binding = claim.binding;
+    if (binding.end) tryStep(errors, () => clearRange(binding));
+    if (claim.usedHole) tryStep(errors, () => binding.dest.clear?.(binding));
+    binding.occupant = null;
+    claim.committed = next;
+    const body = claim.body;
+    claim.body = null;
+    runAll(disposeBodies(body ? [body] : [], [claim], errors), errors);
   }
 }
 
@@ -728,55 +719,28 @@ function commitTarget(rootTarget) {
 
   withCause(ev, () => {
     const applied = { leaving: [], ended: [], commits: [] };
-    let plan = null, releases = null, applyErrors = null;
+    const errors = [];
+    let plan = null, releases = null;
     PHASE = PLAN;
     try {
       plan = planCommit(rootTarget, rootAnchor, rootParent);
       PHASE = APPLY;
       applyPlan(plan.rootNode, plan.nodes, applied);
-      const disposeErrors = [];
-      releases = disposeBodies(applied.leaving, applied.ended, disposeErrors);
-      if (disposeErrors.length) applyErrors = disposeErrors;
     } catch (error) {
       if (!plan) throw error;
-      for (const node of plan.queue) {
-        if (!node.placed && node.draft?.created)
-          for (const seg of node.draft.created)
-            if (!seg.parked) tryStep(null, () => removeSeg(seg));
-        if (!node.placed && node.draft) voidOpened(node.target, node.draft.pass);
-      }
-      applyErrors = [error];
-      releases = disposeBodies(applied.leaving, applied.ended, applyErrors);
+      errors.push(error);
+      recoverApply(plan.queue, errors);
     } finally {
+      if (plan) releases = disposeBodies(applied.leaving, applied.ended, errors);
       PHASE = IDLE;
     }
 
     // Pass 3: Effects — Core is settled; release departing claims before post-order arriving commits
-    const errors = applyErrors ?? [];
+    const applyFailed = errors.length > 0;
     runAll(releases, errors);
-    if (applyErrors) { throwErrors(errors); return; }
+    if (applyFailed) { throwErrors(errors); return; }
 
-    for (const { claim, next, isNew } of applied.commits) {
-      if (!claim.alive) continue;
-      const prev = claim.committed === UNSET ? undefined : claim.committed;
-      ACTIVE_CLAIMS.add(claim);
-      const ok = tryStep(errors, () => {
-        claim.spec.commit(handleOf(claim), prev, next);
-        claim.committed = next;
-      });
-      ACTIVE_CLAIMS.delete(claim);
-      if (!ok && isNew && claim.binding.occupant === claim) {
-        const binding = claim.binding;
-        if (binding.end) tryStep(null, () => clearRange(binding));
-        if (claim.usedHole) tryStep(null, () => binding.dest.clear?.(binding));
-        binding.occupant = null;
-        claim.committed = next;
-        const body = claim.body;
-        claim.body = null;
-        runAll(disposeBodies(body ? [body] : [], [claim], errors), errors);
-      }
-    }
-
+    runCommits(applied.commits, errors);
     debug.enabled && ev && debug.emit({ type: 'settled', target: rootTarget });
     throwErrors(errors);
   });
@@ -793,55 +757,55 @@ const needsPlace = (target, anchor) =>
   target.anchor !== anchor
   || (target.committed.length > 0 && (target.committed[0].parked !== null || !inPlace(anchor, target.committed[0], null)));
 
-function parkSeg(rootSeg, liftBodies = true) {
-  if (!liftBodies) {
-    if (!rootSeg.parked && rootSeg.builder.parent(rootSeg.start))
-      rootSeg.parked = rootSeg.builder.extract(rootSeg.start, rootSeg.end);
-    return;
-  }
-  const order = [rootSeg];
-  for (let i = 0; i < order.length; i++) {
-    for (const binding of order[i].bindings) {
+function extractSeg(seg) {
+  if (!seg.parked && seg.builder.parent(seg.start))
+    seg.parked = seg.builder.extract(seg.start, seg.end);
+}
+
+function parkSegs(initial) {
+  if (!initial.length) return;
+  const segs = initial.slice();
+  for (let i = 0; i < segs.length; i++) {
+    for (const binding of segs[i].bindings) {
       const body = binding.occupant?.body;
-      if (body) for (const s of body.committed) order.push(s);
+      if (body) pushAll(segs, body.committed);
     }
   }
-  for (let i = order.length - 1; i >= 0; i--) {
-    const seg = order[i];
-    if (!seg.parked && seg.builder.parent(seg.start))
-      seg.parked = seg.builder.extract(seg.start, seg.end);
-  }
+  for (let i = segs.length - 1; i >= 0; i--) extractSeg(segs[i]);
 }
 
-function vacateBody(body, liveNodes, applied) {
-  if (liveNodes.has(body)) for (const s of body.committed) parkSeg(s, true);
-  else for (const s of body.committed) dropSeg(s, liveNodes, applied);
-}
-
-function dropSeg(rootSeg, liveNodes, applied) {
-  const segs = [rootSeg];
+function evictSegs(initial, liveNodes, applied, errors) {
+  if (!initial.length) return;
+  const segs = initial.slice();
   for (let i = 0; i < segs.length; i++) {
     for (const binding of segs[i].bindings) {
       const occ = binding.occupant;
-      if (occ) {
-        binding.occupant = null;
-        noteLeaving(occ, applied);
-        if (occ.body) {
-          if (liveNodes.has(occ.body))
-            for (const s of occ.body.committed) parkSeg(s, true);
-          else
-            for (const s of occ.body.committed) segs.push(s);
-        }
-      }
+      if (!occ) continue;
+      binding.occupant = null;
+      noteLeaving(occ, applied);
+      if (!occ.body) continue;
+      if (liveNodes?.has(occ.body)) parkSegs(occ.body.committed);
+      else if (liveNodes) pushAll(segs, occ.body.committed);
     }
   }
   for (let i = segs.length - 1; i >= 0; i--) {
     const seg = segs[i];
-    for (const binding of seg.bindings) if (binding.end) clearRange(binding);
+    for (const binding of seg.bindings) {
+      if (!binding.end) continue;
+      if (errors) { tryStep(errors, () => clearRange(binding)); binding.end = null; }
+      else clearRange(binding);
+    }
     const live = seg.parked === null;
     seg.parked = UNSET;
-    if (live) removeSeg(seg);
+    if (!live) continue;
+    if (errors) tryStep(errors, () => removeSeg(seg));
+    else removeSeg(seg);
   }
+}
+
+function vacateBody(body, liveNodes, applied) {
+  if (liveNodes.has(body)) parkSegs(body.committed);
+  else evictSegs(body.committed, liveNodes, applied, null);
 }
 
 function placeChain(target, anchor, list) {
@@ -932,20 +896,91 @@ function vacateBinding(binding, occ, nextKind, liveNodes, applied) {
   if (occ.body) vacateBody(occ.body, liveNodes, applied);
 }
 
+function reconcileSegments(target, anchor, draft, liveNodes, applied) {
+  let committed = target.committed;
+  const nextList = nextListOf(draft, committed);
+
+  if (draft.mode !== 'amend' && nextList !== committed) {
+    const mark = ++PASS;
+    for (const seg of nextList) seg.keepPass = mark;
+    let order = 0, anyDropped = false;
+    for (const seg of committed) {
+      if (seg.keepPass === mark) { seg.oldIndex = order++; continue; }
+      anyDropped = true;
+      debug.enabled && debug.emit({ type: 'drop', target, segment: seg });
+      evictSegs([seg], liveNodes, applied, null);
+      pruneSeg(target, seg);
+    }
+    if (anyDropped) committed = target.committed = committed.filter((seg) => seg.keepPass === mark);
+  }
+
+  if (nextList !== committed || needsPlace(target, anchor)) {
+    if (draft.mode !== 'amend' && nextList !== committed && target.anchor === anchor) {
+      const mark = ++PASS;
+      markKeepSet(nextList, mark);
+      // reordered segments keep their hosted child bodies intact and move as one subtree
+      for (const seg of nextList) if (!seg.parked && seg.keepPass !== mark) extractSeg(seg);
+    }
+    placeChain(target, anchor, nextList);
+  }
+  return nextList;
+}
+
+function indexCreated(target, created) {
+  for (const seg of created) {
+    let bucket = target.buckets.get(seg.site);
+    if (!bucket) target.buckets.set(seg.site, bucket = { byIndex: [], byKey: new Map() });
+    if (seg.keyed) bucket.byKey.set(seg.key, seg);
+    else bucket.byIndex[seg.index] = seg;
+  }
+}
+
+function applyEdits(edits, liveNodes, applied) {
+  for (const [binding, entry] of edits) {
+    const cur = binding.occupant;
+    if (entry === CLEAR) {
+      if (cur) vacateBinding(binding, cur, null, liveNodes, applied);
+      binding.occupant = null;
+      debug.enabled && debug.emit({ type: 'claim', binding, occupant: null });
+      continue;
+    }
+    let occ = cur;
+    if (occ?.kind !== 'plain') {
+      if (occ) vacateBinding(binding, occ, 'plain', liveNodes, applied);
+      occ = binding.occupant = { kind: 'plain', prev: UNSET };
+      debug.enabled && debug.emit({ type: 'claim', binding, occupant: occ });
+    } else {
+      occ.prev = UNSET;
+    }
+    writeHole(binding, entry);
+    occ.prev = entry;
+  }
+}
+
+function publishClaims(claims, liveNodes, applied) {
+  for (const [binding, claim] of claims) {
+    const cur = binding.occupant, isNew = claim.binding === null;
+    if (cur !== claim) {
+      if (cur) vacateBinding(binding, cur, 'instance', liveNodes, applied);
+      binding.occupant = claim;
+      claim.binding = binding;
+      debug.enabled && debug.emit({ type: 'claim', binding, occupant: claim });
+    }
+    claim.staged = claim.next;
+    if (commitOf(claim.spec)) applied.commits.push({ claim, next: claim.next, isNew });
+  }
+}
+
 function applyOne(node, liveNodes, applied) {
-  const { target, anchor, parent, incomingOcc, draft, edits } = node;
+  const { target, anchor, parent, incomingOcc, draft, edits, claims } = node;
 
   if (incomingOcc && !sameOccupant(anchor.occupant, incomingOcc)) {
     if (anchor.occupant) vacateBinding(anchor, anchor.occupant, incomingOcc.kind, liveNodes, applied);
     anchor.occupant = null;
   }
-
   if (target.anchor && target.anchor !== anchor) {
     const host = target.anchor;
-    if (host.occupant?.body === target) {
-      noteLeaving(host.occupant, applied);
-      host.occupant = null;
-    }
+    if (host.occupant?.body === target) { noteLeaving(host.occupant, applied); host.occupant = null; }
     host.dest.vacate?.(host);
   }
 
@@ -957,85 +992,14 @@ function applyOne(node, liveNodes, applied) {
   }
 
   settleSpan(target, 'flush', draft.pass, () => {
-    let committed = target.committed;
-    const nextList = nextListOf(draft, committed);
-
-    if (draft.mode !== 'amend' && nextList !== committed) {
-      const mark = ++PASS;
-      for (const seg of nextList) seg.keepPass = mark;
-      let anyDropped = false;
-      for (const seg of committed) {
-        if (seg.keepPass === mark) continue;
-        anyDropped = true;
-        debug.enabled && debug.emit({ type: 'drop', target, segment: seg });
-        dropSeg(seg, liveNodes, applied);
-        pruneSeg(target, seg);
-      }
-      if (anyDropped) committed = target.committed = committed.filter((seg) => seg.keepPass === mark);
-    }
-
-    if (nextList !== committed || needsPlace(target, anchor)) {
-      if (draft.mode !== 'amend' && nextList !== committed && target.anchor === anchor) {
-        const mark = ++PASS;
-        markKeepSet(nextList, committed, mark);
-        // reordered segments keep their hosted child bodies intact and move as one subtree
-        for (const seg of nextList) if (!seg.parked && seg.keepPass !== mark) parkSeg(seg, false);
-      }
-      placeChain(target, anchor, nextList);
-    }
-
+    const nextList = reconcileSegments(target, anchor, draft, liveNodes, applied);
     bindTarget(target, anchor, parent, incomingOcc);
     target.committed = nextList;
     node.placed = true;
-    if (draft.created) {
-      for (const seg of draft.created) {
-        let bucket = target.buckets.get(seg.site);
-        if (!bucket) target.buckets.set(seg.site, bucket = { byIndex: [], byKey: new Map() });
-        if (seg.keyed) bucket.byKey.set(seg.key, seg);
-        else bucket.byIndex[seg.index] = seg;
-      }
-    }
-
-    let claims = null;
-    if (edits) {
-      // Apply fallible plain/clear edits before publishing new bodyless claims on this target
-      for (const [binding, entry] of edits) {
-        if (entry?.[STAGED] === 'instance') { (claims ??= []).push([binding, entry]); continue; }
-        const cur = binding.occupant;
-        if (entry === CLEAR) {
-          if (cur) vacateBinding(binding, cur, null, liveNodes, applied);
-          binding.occupant = null;
-          debug.enabled && debug.emit({ type: 'claim', binding, occupant: null });
-          continue;
-        }
-        let occ = cur;
-        if (occ?.kind !== 'plain') {
-          if (occ) vacateBinding(binding, occ, 'plain', liveNodes, applied);
-          occ = binding.occupant = { kind: 'plain', prev: UNSET };
-          debug.enabled && debug.emit({ type: 'claim', binding, occupant: occ });
-        } else {
-          occ.prev = UNSET;
-        }
-        writeHole(binding, entry);
-        occ.prev = entry;
-      }
-    }
-
+    if (draft.created) indexCreated(target, draft.created);
+    if (edits) applyEdits(edits, liveNodes, applied);
     deliver(target, anchor);
-
-    if (claims) {
-      for (const [binding, claim] of claims) {
-        const cur = binding.occupant, isNew = claim.binding === null;
-        if (cur !== claim) {
-          if (cur) vacateBinding(binding, cur, 'instance', liveNodes, applied);
-          binding.occupant = claim;
-          claim.binding = binding;
-          debug.enabled && debug.emit({ type: 'claim', binding, occupant: claim });
-        }
-        claim.staged = claim.next;
-        if (commitOf(claim.spec)) applied.commits.push({ claim, next: claim.next, isNew });
-      }
-    }
+    if (claims) publishClaims(claims, liveNodes, applied);
   });
 }
 
