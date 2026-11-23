@@ -32,6 +32,7 @@ const same = (a, b) => a === b || (a !== a && b !== b);
 const carriesIdentity = (key) => key !== undefined && key !== null && key !== true && key !== false;
 
 const sameOccupant = (a, b) => a === b || (a?.kind === 'body' && b?.kind === 'body' && a.body === b.body);
+const liveClaimOf = (target) => (target.ownerClaim?.binding && target.ownerClaim.alive ? target.ownerClaim : null);
 
 const stageOf = (spec) => (typeof spec === 'function' ? spec : spec.stage);
 const commitOf = (spec) => (typeof spec === 'function' ? null : spec.commit);
@@ -148,7 +149,7 @@ function dropOpened(root, since, rootDraft = root.staged, until = Infinity) {
     for (const child of cur.children) visit(child);
     if (draft?.children)
       for (const child of draft.children)
-        if (!child.anchor && !(child.ownerClaim?.binding && child.ownerClaim.alive)) visit(child);
+        if (!child.anchor && !liveClaimOf(child)) visit(child);
     if (i > 0 && cur.staged && cur.staged.pass > since && cur.staged.pass <= until) cur.staged = null;
   }
 }
@@ -266,7 +267,7 @@ function makeSegment(site, keyOrIndex, keyed) {
       site, template, builder, keyed,
       key: keyed ? keyOrIndex : undefined,
       index: keyed ? -1 : keyOrIndex,
-      start, end, bindings: null, parked: content,
+      start, end, bindings: null, parked: content, retired: false,
       seenPass: 0, keepPass: 0, oldIndex: -1,
     };
   seg.bindings = template.holes.map((hole, index) => {
@@ -667,11 +668,8 @@ function planCommit(rootTarget, rootAnchor, rootParent) {
           attachChild(child, child.anchor, node, null);
       if (!draft?.edits) continue;
 
-      const liveSegs = draft.mode === 'amend' && draft.base !== target.committed
-        ? new Set(target.committed.concat(draft.created ?? [])) : null;
       const edits = node.edits = new Map(draft.edits);
       for (const [binding, entry] of edits) {
-        if (liveSegs && !liveSegs.has(binding.seg)) { edits.delete(binding); continue; }
         checkReentry(ACTIVE_CLAIMS.size && ACTIVE_CLAIMS.has(binding.occupant));
         const tag = entry?.[STAGED];
         if (!tag) continue;
@@ -723,10 +721,10 @@ function recoverApply(queue, errors, rootTarget, applied) {
     if (node.draft.created) {
       const owner = liveOwner(node.target, node.parent, rootTarget);
       for (const seg of node.draft.created)
-        if (seg.parked === null) {
+        if (!seg.parked && !seg.retired) {
           const before = errors.length;
           tryStep(errors, () => removeSeg(seg));
-          if (errors.length === before) seg.parked = UNSET;
+          if (errors.length === before) seg.retired = true;
           else { (applied.tried ??= new Set()).add(seg); queuePending(owner, seg); }
         }
     }
@@ -763,8 +761,7 @@ function runCommits(commits, errors) {
 
 function commitTarget(rootTarget) {
   assertIdle('call commit()');
-  const lazyClaim = !rootTarget.anchor && rootTarget.ownerClaim?.binding && rootTarget.ownerClaim.alive
-    ? rootTarget.ownerClaim : null;
+  const lazyClaim = !rootTarget.anchor ? liveClaimOf(rootTarget) : null;
   const rootAnchor = rootTarget.anchor ?? lazyClaim?.binding ?? null;
   const rootParent = rootTarget.anchor ? rootTarget.parent : lazyClaim?.owner ?? null;
   if (!rootAnchor) throw new Error('temtie/core: cannot commit an unanchored capture');
@@ -825,7 +822,7 @@ function parkSegs(initial) {
   }
   for (let i = segs.length - 1; i >= 0; i--) {
     const seg = segs[i];
-    if (!seg.parked && seg.builder.parent(seg.start))
+    if (!seg.parked && !seg.retired && seg.builder.parent(seg.start))
       seg.parked = seg.builder.extract(seg.start, seg.end);
   }
 }
@@ -836,10 +833,11 @@ function queuePending(owner, seg) {
 }
 
 function finishEvict(seg) {
-  if (seg.parked === UNSET) return;
+  if (seg.retired) return;
   for (const binding of seg.bindings) if (binding.end) clearRange(binding);
-  if (seg.parked === null) removeSeg(seg);
-  seg.parked = UNSET;
+  if (!seg.parked) removeSeg(seg);
+  seg.parked = null;
+  seg.retired = true;
 }
 
 function drainPending(target, applied) {
@@ -876,7 +874,7 @@ function evictSegs(initial, owner, liveNodes, applied, errors) {
   try {
     for (; i >= 0; i--) {
       const seg = segs[i];
-      if (seg.parked === UNSET) continue;
+      if (seg.retired) continue;
       if (applied.tried?.has(seg)) {
         if (owner) queuePending(owner, seg);
         continue;
@@ -895,7 +893,7 @@ function evictSegs(initial, owner, liveNodes, applied, errors) {
   } finally {
     if (i >= 0) {
       (applied.tried ??= new Set()).add(segs[i]);
-      if (owner) for (let j = i; j >= 0; j--) if (segs[j].parked !== UNSET) queuePending(owner, segs[j]);
+      if (owner) for (let j = i; j >= 0; j--) if (!segs[j].retired) queuePending(owner, segs[j]);
     }
   }
 }
