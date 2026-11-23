@@ -355,7 +355,7 @@ function resolveSegment(target, draft, seg, values) {
       }
     }
     const occ = binding.occupant;
-    if (occ ? (occ.kind === 'plain' && same(occ.prev, raw)) : !binding.dest.write) {
+    if (!PLAN_NODES && (occ ? (occ.kind === 'plain' && same(occ.prev, raw)) : !binding.dest.write)) {
       edits?.delete(binding);
       continue;
     }
@@ -1005,7 +1005,8 @@ function applyEdits(target, edits, liveNodes, applied) {
   for (const [binding, entry] of edits) {
     const cur = binding.occupant;
     if (entry === CLEAR) {
-      if (cur) vacateBinding(binding, cur, null, target, liveNodes, applied);
+      if (!cur) continue;
+      vacateBinding(binding, cur, null, target, liveNodes, applied);
       binding.occupant = null;
       debug.enabled && debug.emit({ type: 'claim', binding, occupant: null });
       continue;
@@ -1016,6 +1017,7 @@ function applyEdits(target, edits, liveNodes, applied) {
       occ = binding.occupant = { kind: 'plain', prev: UNSET };
       debug.enabled && debug.emit({ type: 'claim', binding, occupant: occ });
     } else {
+      if (same(occ.prev, entry)) continue;
       occ.prev = UNSET;
     }
     writeHole(binding, entry);
