@@ -6,10 +6,16 @@ import { compileTemplate } from '../parser.js';
 
 const NODE = Symbol('markup.node');
 
-function markTree(node) {
-  if (!node || typeof node !== 'object') return;
-  node[NODE] = true;
-  for (const child of node.children ?? []) markTree(child);
+function markTree(root) {
+  if (!root || typeof root !== 'object') return;
+  const stack = [root];
+  while (stack.length) {
+    const node = stack.pop();
+    node[NODE] = true;
+    if (node.children)
+      for (const child of node.children)
+        if (child && typeof child === 'object') stack.push(child);
+  }
 }
 
 function el(type) {
@@ -267,18 +273,23 @@ function serializeProps(props, sources) {
   return out;
 }
 
-function serializeNode(node, voidElements) {
-  if (node == null || node.marker) return '';
-  if ('text' in node) return node.source ?? escapeText(String(node.text));
-
-  const children = (node.children ?? [])
-    .map((child) => serializeNode(child, voidElements))
-    .join('');
-  if (!node.type || node.type[0] === '#') return children;
-
-  const open = `<${node.type}${serializeProps(node.props ?? {}, node.sources)}>`;
-  if (voidElements.has(node.type.toLowerCase())) return open;
-  return `${open}${children}</${node.type}>`;
+function serializeNode(root, voidElements) {
+  const out = [], stack = [root];
+  while (stack.length) {
+    const item = stack.pop();
+    if (item == null || item.marker) continue;
+    if (typeof item === 'string') { out.push(item); continue; }
+    if ('text' in item) { out.push(item.source ?? escapeText(String(item.text))); continue; }
+    const isTag = item.type && item.type[0] !== '#';
+    if (isTag) {
+      out.push(`<${item.type}${serializeProps(item.props ?? {}, item.sources)}>`);
+      if (voidElements.has(item.type.toLowerCase())) continue;
+      stack.push(`</${item.type}>`);
+    }
+    const children = item.children;
+    if (children) for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
+  }
+  return out.join('');
 }
 
 export function serialize(node) {

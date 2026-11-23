@@ -23,6 +23,7 @@ const IDLE = 0, PLAN = 1, APPLY = 2;
 
 let PASS = 0;
 let PHASE = IDLE;
+let PLAN_NODES = null;
 
 // SameValueZero. NaN equals NaN.
 const same = (a, b) => a === b || (a !== a && b !== b);
@@ -176,6 +177,11 @@ function compile(builder, strings, target, pass) {
   return site;
 }
 
+function isDroppedInPlan(target, seg) {
+  const draft = PLAN_NODES?.get(target)?.draft;
+  return !!draft && draft.mode !== 'amend' && !nextListOf(draft, target.committed).includes(seg);
+}
+
 function makeChannel(builder) {
   return function channel(strings, ...values) {
     const target = refTarget(this[PRIVATE], true);
@@ -189,7 +195,11 @@ function makeChannel(builder) {
     let seg, keyOrIndex, fresh = false;
     if (keyed) {
       keyOrIndex = key;
-      seg = draft.createdKeys?.get(site)?.get(key) ?? bucket?.byKey.get(key);
+      seg = draft.createdKeys?.get(site)?.get(key);
+      if (!seg) {
+        seg = bucket?.byKey.get(key);
+        if (seg && PLAN_NODES && isDroppedInPlan(target, seg)) seg = undefined;
+      }
       if (seg?.seenPass === draft.pass)
         debug.enabled && debug.assert(false, 'temtie/core: duplicate key in one pass',
           { assert: 'duplicate-key', target, key, segment: seg });
@@ -197,6 +207,7 @@ function makeChannel(builder) {
       keyOrIndex = draft.used?.get(site) ?? 0;
       (draft.used ??= new Map()).set(site, keyOrIndex + 1);
       seg = bucket?.byIndex[keyOrIndex];
+      if (seg && PLAN_NODES && isDroppedInPlan(target, seg)) seg = undefined;
     }
 
     if (!seg) {
@@ -616,6 +627,7 @@ function planCommit(rootTarget, rootAnchor, rootParent) {
   };
 
   let i = 0, stagingRef = null;
+  PLAN_NODES = nodes;
   try {
     for (; i < queue.length; i++) {
       const node = queue[i], target = node.target;
@@ -660,6 +672,7 @@ function planCommit(rootTarget, rootAnchor, rootParent) {
     }
     return { rootNode, nodes, queue };
   } finally {
+    PLAN_NODES = null;
     if (stagingRef?.target?.staged) stagingRef.target.staged = null;
     for (let j = i + 1; j < queue.length; j++) {
       const t = queue[j].target;
@@ -922,7 +935,9 @@ function reconcileSegments(target, anchor, draft, liveNodes, applied) {
       pruneSeg(target, seg);
     }
     if (anyDropped) target.committed = committed.filter((seg) => seg.keepPass === mark);
-    if (target.anchor === anchor && anchor.dest.after) keepMark = markKeepSet(nextList, mark);
+    const anchorOk = target.anchor === anchor && anchor.dest.after
+      && (anchor.dest.kind !== ROOT || (anchor.marker && nextList[0]?.builder.parent(anchor.marker) === anchor.node));
+    if (anchorOk) keepMark = markKeepSet(nextList, mark);
   }
 
   placeChain(target, anchor, nextList, keepMark);

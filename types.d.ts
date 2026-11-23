@@ -76,8 +76,42 @@ declare module 'temtie' {
     | boolean
     | null
     | undefined
-    | object
-    | Iterable<Renderable>;
+    | object;
+
+  export interface HoleRange<B extends Builder<any, any> = Builder<any, any>> {
+    readonly start: BuilderNode<B>;
+    readonly end: BuilderNode<B>;
+    readonly builder: B;
+    clear(): void;
+  }
+
+  export interface Handle<B extends Builder<any, any> = Builder<any, any>, Bs extends Builders = DefaultBuilders> {
+    readonly kind: 'child' | 'attr' | 'meta';
+    readonly builder: B;
+    readonly node: BuilderNode<B> | null;
+    readonly marker: BuilderNode<B> | null;
+    readonly prop: PropertyKeyLike | null;
+    readonly name: PropertyKeyLike | null;
+    readonly target: Instance<Bs>;
+    set?(value: Renderable): void;
+    range?(): HoleRange<B> | null;
+  }
+
+  export type StageFn<V = any, Bs extends Builders = DefaultBuilders> = (
+    target: Instance<Bs>,
+    prev: V | undefined,
+    next: V
+  ) => void;
+
+  export interface ValueDescriptor<
+    V = any,
+    B extends Builder<any, any> = Builder<any, any>,
+    Bs extends Builders = DefaultBuilders
+  > {
+    stage?: StageFn<V, Bs>;
+    commit?(handle: Handle<B, Bs>, prev: V | undefined, next: V): void;
+    release?(handle: Handle<B, Bs>, current: V): void;
+  }
 
   export type Channel = (strings: TemplateStringsArray, ...values: Renderable[]) => void;
 
@@ -137,7 +171,7 @@ declare module 'temtie' {
     | { type: 'mount'; target: DebugTarget; container: unknown; builders: readonly string[] }
     | { type: 'call'; target: DebugTarget; pass: number; via: DebugVia }
     | { type: 'stage'; target: DebugTarget; pass: number; segment: DebugSegment; template: Template; fresh: boolean; key?: unknown }
-    | { type: 'claim' | 'displace' | 'end'; binding: DebugBinding; occupant: DebugOccupant | null }
+    | { type: 'claim' | 'end'; binding: DebugBinding; occupant: DebugOccupant | null }
     | { type: 'write'; binding: DebugBinding; value: unknown }
     | { type: 'deliver'; target: DebugTarget; binding: DebugBinding }
     | { type: 'move'; target: DebugTarget; segment: DebugSegment; container: unknown; after: unknown }
