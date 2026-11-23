@@ -106,7 +106,7 @@ function makeRef(target, claim = null) {
 function makeTarget(proto) {
   return {
     proto, anchor: null, parent: null, children: new Set(),
-    committed: [], buckets: new Map(), ownerClaim: null, staged: null,
+    committed: [], buckets: new Map(), ownerClaim: null, staged: null, dirty: false,
   };
 }
 
@@ -448,7 +448,7 @@ function makeHandle(claim) {
   return handle;
 }
 
-function markKeepSet(nextList, prevMark) {
+function markKeepSet(nextList) {
   const seq = [], segs = [];
   let prevIdx = -1, ordered = true;
   for (let i = 0; i < nextList.length; i++) {
@@ -459,7 +459,7 @@ function markKeepSet(nextList, prevMark) {
     seq.push(seg.oldIndex);
     segs.push(seg);
   }
-  if (ordered) return prevMark;
+  if (ordered) return 0;
   const n = seq.length, mark = ++PASS, tails = [], prev = new Int32Array(n);
   for (let i = 0; i < n; i++) {
     const val = seq[i];
@@ -539,6 +539,7 @@ function disposeBodies(roots, endedClaims, errors) {
       body.committed = [];
       body.buckets.clear();
       body.children.clear();
+      body.dirty = false;
       body.staged = body.anchor = body.parent = null;
     }
   }
@@ -772,7 +773,7 @@ function inPlace(anchor, seg, prevEnd) {
 }
 
 const needsPlace = (target, anchor) =>
-  target.anchor !== anchor
+  target.dirty || target.anchor !== anchor
   || (target.committed.length > 0 && (target.committed[0].parked !== null || !inPlace(anchor, target.committed[0], null)));
 
 function parkSegs(initial) {
@@ -825,14 +826,14 @@ function vacateBody(body, liveNodes, applied) {
   else evictSegs(body.committed, liveNodes, applied, null);
 }
 
-function placeChain(target, anchor, list, keepMark = 0) {
+function placeChain(target, anchor, list) {
   let prevEnd = null;
   for (const seg of list) {
-    if (keepMark && !seg.parked && seg.keepPass === keepMark) { prevEnd = seg.end; continue; }
     if (seg.parked || !inPlace(anchor, seg, prevEnd)) {
       const builder = seg.builder,
         after = prevEnd ?? anchor.dest.after?.(anchor, builder),
         container = anchor.dest.container(anchor);
+      target.dirty = true;
       if (!seg.parked) {
         debug.enabled && debug.assert(builder.parent(seg.start),
           'temtie/core: cannot place a segment whose nodes left the medium',
@@ -845,6 +846,7 @@ function placeChain(target, anchor, list, keepMark = 0) {
     }
     prevEnd = seg.end;
   }
+  target.dirty = false;
 }
 
 function deliver(target, anchor) {
@@ -922,7 +924,6 @@ function reconcileSegments(target, anchor, draft, liveNodes, applied) {
     return committed;
   }
 
-  let keepMark = 0;
   if (draft.mode !== 'amend') {
     const mark = ++PASS;
     for (const seg of nextList) seg.keepPass = mark;
@@ -935,12 +936,19 @@ function reconcileSegments(target, anchor, draft, liveNodes, applied) {
       pruneSeg(target, seg);
     }
     if (anyDropped) target.committed = committed.filter((seg) => seg.keepPass === mark);
-    const anchorOk = target.anchor === anchor && anchor.dest.after
-      && (anchor.dest.kind !== ROOT || (anchor.marker && nextList[0]?.builder.parent(anchor.marker) === anchor.node));
-    if (anchorOk) keepMark = markKeepSet(nextList, mark);
+    if (target.anchor === anchor && !target.dirty) {
+      const keepMark = markKeepSet(nextList);
+      if (keepMark) {
+        target.dirty = true;
+        // extract non-LIS moved segments so inPlace() keeps the LIS untouched
+        for (const seg of nextList)
+          if (!seg.parked && seg.keepPass !== keepMark && seg.builder.parent(seg.start))
+            seg.parked = seg.builder.extract(seg.start, seg.end);
+      }
+    }
   }
 
-  placeChain(target, anchor, nextList, keepMark);
+  placeChain(target, anchor, nextList);
   return nextList;
 }
 
