@@ -1,33 +1,39 @@
 # ꙋ temtie
 
-**Template calls that remember their place and update from there.**
+**Immediate-mode templates that remember their place in the DOM.**
 
-Temtie is an immediate-mode template runtime. You call tagged templates from
-ordinary JavaScript, those calls record a target's next shape, and `commit()`
-applies the recorded pass to the medium.
+You write ordinary JavaScript — loops, `if` statements, functions — and call
+tagged templates. Those calls only record a draft; nothing touches the DOM 
+until you call `commit()`. When you do, Temtie updates existing nodes in place,
+moves reordered items with minimal DOM mutations, and removes anything
+the new pass left out.
 
-> No virtual tree, no diff over trees, no compiler, no proxies:<br>
-> a template call site *is* its identity, and plain control flow decides what renders.
+There is no virtual DOM, no build-time compiler, and no reactive primitives.
 
 ```js
 import { mount, capture, commit, reset } from 'temtie/core.js';
 import { dom } from 'temtie/builder/dom.js';
 
-const app = mount(document.body, { builders: { html: dom } });
+const app = mount(document.body, { html: dom });
+const list = capture();
 
-let items = ['first', 'second'];
+let items = ['Write templates', 'Commit changes'];
+
+function add(text) {
+  items = [...items, text];
+  render();
+}
 
 function render() {
-  const list = capture();
-
   app.html`
-    <section>
-      <h1>Items</h1>
+    <main>
+      <h1>Tasks (${items.length})</h1>
+      <button onclick=${() => add(`Task ${items.length + 1}`)}>Add</button>
       <ul>${list}</ul>
-    </section>
+    </main>
   `;
 
-  reset(list); // emptiness is staged too: no items, no rows
+  reset(list); // clear before looping so an empty array renders zero rows
   for (const item of items) {
     list.html`<li #key${item}>${item}</li>`;
   }
@@ -38,241 +44,301 @@ function render() {
 render();
 ```
 
-The render language is JavaScript: loops, branches, functions, generators —
-whatever produces the calls produces the page.
+## How It Works
 
-## The Model
+Three rules explain almost everything in Temtie:
 
-- **Call sites keep identity.** The same tagged-template call site visited
-  again finds its own segment of the medium and updates it in place. In
-  loops, `#key${value}` pins a segment to a value instead of a position.
-- **Render records.** Channel calls stage a target's next pass. Nothing
-  touches the medium while you render — a pass is data until it commits.
-- **Commit applies, and settles everything.** `commit(target)` flushes the
-  staged pass, parents before children, and one law covers every ending:
-  what a pass did not stage leaves the medium and is disposed.
-
-Between record and commit there are two controls: `discard()` voids a staged
-pass while the committed output stands, and `reset()` stages emptiness.
+1. **Call sites keep their identity.** Calling the same tagged template literal
+   again reuses the DOM nodes it created last time and updates only the values
+   that changed. Inside a loop, `#key${id}` ties a row to an ID instead of its
+   position so reordering moves existing nodes instead of rebuilding them.
+2. **Staging is inert.** Calling ``capture.html`...` `` only records a draft.
+   It does not mutate the DOM or trigger side effects, so you can abandon
+   a half-written pass with `discard()`, leaving the live DOM untouched.
+3. **`commit(capture)` settles in three phases:**
+   - **Plan**: expands any value contracts, resolves capture moves, and checks
+     for cycles without touching the DOM. If anything throws here,
+     nothing on screen changes.
+   - **Apply**: removes dropped segments, moves reordered segments minimally
+     (using longest increasing subsequence), and writes changed slots.
+   - **Effects**: runs `release()` on departing contracts first, then runs
+     `commit()` hooks post-order (children before parents).
 
 ## Mounts And Captures
 
-`mount(container, { builders })` creates a target seated on a container.
+`mount(container, { html, svg })` attaches a root capture to a container. Each passed
+builder becomes a tagged-template channel on every capture under that root.
 
 ```js
-const app = mount(document.body, { builders: { html: dom } });
+const app = mount(document.body, { html: dom });
 app.html`<main>Hello</main>`;
 commit(app);
 ```
 
-`capture()` creates a free target reference. It gets builder channels when it
-is interpolated into a template slot.
+`capture()` creates a standalone capture target you can place inside a template slot.
+Once anchored, it inherits the same channels and can be committed on its own
+without re-rendering its parent:
 
 ```js
-const body = capture();
-
-app.html`<main>${body}</main>`;
-body.html`<h1>Dashboard</h1>`;
-commit(app);
-```
-
-Captured targets are the composition primitive. They let a parent own layout
-while a child owns its own update cycle:
-
-```js
-const shell = mount(document.body, { builders: { html: dom } });
+const shell = mount(document.body, { html: dom });
 const clock = capture();
 
-shell.html`<header>${clock}</header><main>...</main>`;
+shell.html`<header>${clock}</header><main>Dashboard</main>`;
 commit(shell);
 
 setInterval(() => {
   clock.html`<time>${new Date().toLocaleTimeString()}</time>`;
-  commit(clock);
+  commit(clock); // only updates the clock; shell does not re-run
 }, 1000);
 ```
 
-Commit flushes staged targets downward from the one passed, so the shell does
-not re-run when the clock commits.
+Captures you do not touch in a pass keep their committed output. Because a `for`
+loop over an empty array makes zero calls, call `reset(list)` beforehand when
+empty should mean "remove all rows" — any rows the loop *does* emit still reuse
+their existing DOM nodes.
 
-One consequence of "commit settles everything": disposal is scoped to staged
-passes, so a target you do not call keeps its committed output. A loop that
-may run zero times stages nothing on its target — stage emptiness first, as
-the opening example does with `reset(list)`, and the loop's calls rebuild
-over it while reusing every segment they borrow.
+## Updating, Amending, And Discarding
 
-## Slots
+Temtie gives you three explicit draft controls between renders and `commit()`:
 
-Child slots write child content:
-
-```js
-root.html`<p>${message}</p>`;
-```
-
-Attribute slots write properties or attributes:
+- **`reset(target)`** starts a fresh replacement pass (staging emptiness). Any
+  segments you emit before `commit()` still reuse existing nodes by call site
+  and `#key`; anything you omit is removed on commit.
+- **`amend(target)`** updates only the segments you touch (and appends any new
+  ones) without dropping untouched segments. Useful for updating `n` keyed rows
+  in a large list in O(n) time:
 
 ```js
-root.html`<button disabled=${locked}>Save</button>`;
+// Create one call site so amend() targets the same keyed segments
+const renderRow = (row) => list.html`<li #key${row.id}>${row.text}</li>`;
+
+// Full render
+function renderAll(rows) {
+  reset(list);
+  for (const row of rows) renderRow(row);
+  commit(list);
+}
+
+// Patch a single row without iterating the whole list
+function updateRow(row) {
+  amend(list);
+  renderRow(row);
+  commit(list);
+}
 ```
 
-Spread slots write prop bags:
-
-```js
-root.html`<input ...${props}>`;
-```
-
-Use a fresh spread object when values change; mutating and reusing the same
-bag is invisible to the diffing step.
-
-Captures can occupy child slots and prop slots, which allows passing content
-as props:
-
-```js
-const pane = capture();
-
-root.html`<section>${pane}</section>`;
-pane.html`<p>child target</p>`;
-
-root.html`<widget view=${pane}></widget>`;
-// the prop receives pane's output
-```
-
-Spread slots cannot host targets or value contracts.
-
-## Discard And Reset
-
-`discard(target)` voids an uncommitted pass. The committed output remains, and
-nothing staged by the discarded pass is released.
+- **`discard(target)`** cancels the current uncommitted draft so the committed
+  DOM stays as it was, e.g. for error recovery:
 
 ```js
 try {
-  content.html`<article>${smh}</article>`;
-  thisThrows();
+  content.html`<article>${panel}</article>`;
+  renderPanel(panel); // might throw
 } catch (error) {
   discard(content);
-  errors.html`<pre>${error.message}</pre>`;
-  content.html`${smh}`; // nested targets can be recovered
+  banner.html`<pre>${error.message}</pre>`;
 }
 
 commit(app);
 ```
 
-`reset(target)` stages emptiness. The next `commit(target)` clears that
-target. If you render into it again before committing, segments can still be
-borrowed — reset-then-render is a full rebuild that keeps identity.
+## Slots And Template Syntax
+
+Templates support three kinds of slots:
+
+- **Child slots** (`<p>${text}</p>`): plain values write directly into a single
+  text node (never parsed as HTML, no extra comment markers). `null`,
+  `undefined`, and `false` write empty text.
+- **Attribute / property slots** (`<button disabled=${locked} onclick=${save}>`):
+  on `DOMBuilder`, `on*` functions bind directly as properties, standard form
+  properties (`value`, `checked`, `indeterminate`, `selected`) sync directly,
+  booleans toggle attributes, and other values write via `setAttribute`.
+- **Spread slots** (`<input ...${props}>`): diffs keys against the previous
+  bag and removes omitted keys. Pass a new object when props change — mutating
+  the same object in place is treated as unchanged.
+
+Captures can be placed in both child slots and attribute/property slots (passing
+rendered fragments as props). Spread slots only accept plain prop objects.
+
+### Syntax Rules
+
+The template parser is deliberately small and strict — malformed templates throw
+a `SyntaxError` at compile time:
+
+- Dynamic attributes must be unquoted: `class=${name}` (not `class="${name}"`).
+- Spreads use exact `...${props}` inside an opening tag.
+- `#key${value}` pins segment identity in loops; it must sit on a root element
+  of the template and is never written to the DOM. `undefined`, `null`, `true`,
+  and `false` carry no key identity (`0`, `''`, and `NaN` do).
+- Tag names start with an ASCII letter; attribute names may keep prefixes like
+  `.value`, `@click`, or `?disabled` for custom builders.
+- Templates compile once per call site per builder and are cached.
+
+<!-- 
+## Extending Slots With Value Contracts
+
+Core stays small by giving userland a single extension point: any object or
+function carrying `[Symbol.for('temtie.value')]` is treated as a **value
+contract**.
+
+The symbol points to a static descriptor `{ stage?, commit?, release? }` (or a
+bare function as shorthand for `{ stage }`; TypeScript users can import
+`import type { ValueDescriptor } from 'temtie'`). Keep descriptors stable
+across passes — the descriptor identity keeps the claim alive in that hole —
+and pass fresh, immutable payload objects when values change. All contract
+callbacks are synchronous, and `prev` is the retained previous payload value,
+not a deep snapshot:
+
+- **`stage(target, prev, next)`** runs in the **Plan** phase (DOM-free). Use it
+  to stage child templates into `target` or skip work when `prev` matches
+  `next`. `prev` is `undefined` on first mount and only advances once the
+  target's writes and descendants finish applying. Failed Plan work is
+  abandoned before touching the DOM; Apply and Effects do not provide general
+  rollback.
+- **`commit(handle, prev, next)`** runs in the **Effects** phase (post-order,
+  after the DOM is updated and departing claims have released). `handle` gives
+  you `{ kind, builder, node, marker, prop, name, target }` plus `handle.set()`
+  (for writable slots) and `handle.range()` (for managing multi-node ranges in
+  child slots). `handle.target` is lazy — hole-only contracts allocate no child
+  target unless you touch it.
+- **`release(handle, current)`** runs when the claim leaves the hole or its
+  segment is dropped, before any arriving `commit()` runs.
 
 ```js
-reset(list);
-commit(list); // list is now empty
+/** @import { ValueDescriptor } from 'temtie' */
+
+const VALUE = Symbol.for('temtie.value');
+
+// Example 1: element ref (runs in Effects, no child target allocated)
+/** @type {ValueDescriptor} */
+const REF = {
+  commit(handle, prev, next) {
+    if (prev && prev.fn !== next.fn) prev.fn(null);
+    next.fn(handle.node);
+  },
+  release(_handle, cur) {
+    cur.fn(null);
+  },
+};
+const ref = (fn) => ({ [VALUE]: REF, fn });
+
+// Example 2: memoized subtree (runs in Plan; failed Plan work is abandoned)
+/** @type {ValueDescriptor} */
+const MEMO = {
+  stage(target, prev, next) {
+    if (prev && prev.key === next.key) return;
+    reset(target);
+    next.render(target);
+  },
+};
+const memo = (key, render) => ({ [VALUE]: MEMO, key, render });
+
+function render(count) {
+  app.html`<div ref=${ref((el) => console.log(el))}>${memo(count, (t) => t.html`<b>${count}</b>`)}</div>`;
+  commit(app);
+}
+
+render(1);
 ```
 
-## Builders
+A few guardrails built into contracts:
+- A contract cannot both stage templates into `target` and write directly
+  through `handle.set()` / `handle.range()`.
+- `commit()` and handle writes are rejected while a commit is in Plan/Apply.
+- Same-claim reentry (a `commit()` synchronously triggering another `commit()`
+  that updates or removes itself) is rejected in Plan. -->
 
-Temtie renders through builders and never touches a medium directly. A
-builder owns parsing products, node and range movement, property writes, and
-child writes — the whole contract is the `Builder` interface in `types.d.ts`.
-Anything that can create, move, and write nodes can be a universe.
+## Builders: DOM, SVG, And Markup
+
+Temtie never touches browser globals directly — all node creation, movement, and
+property writes go through a builder (`import type { Builder } from 'temtie'`).
+
+### DOM & SVG
+
+`dom` and `svg` are ready-to-use instances of `DOMBuilder` and `SVGBuilder`
+bound to `globalThis.document`. Pass a custom `document` (for iframes or test
+DOMs) by instantiating the classes directly:
 
 ```js
+import { mount, commit } from 'temtie/core.js';
 import { DOMBuilder, SVGBuilder, dom, svg } from 'temtie/builder/dom.js';
 
-const app = mount(document.body, {
-  builders: { html: dom, svg },
-});
-
-const frame = document.querySelector('iframe');
-const frameApp = mount(frame.contentDocument.body, {
-  builders: {
-    html: new DOMBuilder(frame.contentDocument),
-    svg: new SVGBuilder(frame.contentDocument),
-  },
-});
-
-app.html`<button>${label}</button>`;
-app.svg`<svg><circle r=${4}></circle></svg>`;
+const app = mount(document.body, { html: dom, svg });
+app.html`<button>Click</button>`;
+app.svg`<svg viewBox="0 0 10 10"><circle r=${4}></circle></svg>`;
 commit(app);
+
+// Isolated document (e.g. iframe)
+const frameDoc = document.querySelector('iframe').contentDocument;
+const frameApp = mount(frameDoc.body, {
+  html: new DOMBuilder(frameDoc),
+  svg: new SVGBuilder(frameDoc),
+});
 ```
 
-Each builder key becomes a channel on every target in that universe.
-`DOMBuilder.voidElements` and `SVGBuilder.voidElements` are mutable sets. Copy
-one in a subclass when a document vocabulary needs its own void elements.
-The markup medium follows the same split: `MarkupBuilder` is the class and
-`markup` is its ready-to-use default instance.
+Inside `DOMBuilder`, `<svg>` automatically switches children to the SVG
+namespace and `<foreignObject>` switches back to HTML. `DOMBuilder.voidElements`
+and `SVGBuilder.voidElements` are mutable `Set`s you can copy/customize in a
+subclass.
 
-## Template Syntax
+### Markup (SSR / Headless)
 
-The parser is intentionally small and strict — malformed templates throw a
-`SyntaxError` at compile, naming the offense.
+`temtie/builder/markup.js` renders into a lightweight plain-JS tree and
+serializes to HTML strings on demand:
 
-- Dynamic attributes are unquoted: `class=${name}`.
-- Quoted dynamic attributes are rejected: `class="${name}"`.
-- Spread props use `...${props}` inside an opening tag.
-- `#key${value}` keys the segment; it belongs on a root element of the
-  template and never reaches the medium. `undefined`, `null`, `true` and
-  `false` carry no identity, so a row that takes one of them is matched by
-  its position in the pass rather than by a key.
-- Text in child slots is text, not HTML.
-- Whether `<input>` may omit its closing is the builder's call
-  (`isVoidElement`); `DOMBuilder` knows HTML's void set.
+```js
+import { mount, commit } from 'temtie/core.js';
+import { markup, serialize } from 'temtie/builder/markup.js';
 
-Templates compile once per call site per builder and are cached.
+const root = markup.createRoot();
+const page = mount(root, { html: markup });
+
+page.html`<article><h1>${'Hello <world>'}</h1></article>`;
+commit(page);
+
+serialize(root); // '<article><h1>Hello &lt;world&gt;</h1></article>'
+```
 
 ## Debugging
 
-The runtime narrates itself. `debug.js` is an event hub every phase reports
-to — mount, call, stage, claim, write, move, drop, commit, dispose. While
-nothing listens, the guarded event objects are not created.
+`temtie/debug.js` is a lightweight event hub that emits structured lifecycle
+events (`mount`, `call`, `stage`, `claim`, `write`, `move`, `drop`, `commit`,
+`flush`, `place`, `sealed`, `settled`, `end`, `dispose`, `compile`, `compiled`,
+`assert-failed`). When no listener is attached, event objects are not allocated.
 
 ```js
 import debug from 'temtie/debug.js';
 
-const off = debug.on((event) => console.log(event.seq, event.type));
-```
+const off = debug.on((ev) => console.log(ev.seq, ev.cause, ev.type));
 
-A production entry can permanently detach observers and reject future ones
-for that module instance:
+// Measure commit duration via performance.measure()
+const stopMeter = debug.meter({ 'temtie:commit': ['commit', 'settled'] });
 
-```js
+// Optional: permanently detach listeners in production builds
 debug.disable();
 ```
 
-Events carry `seq` and `cause`, so their synchronous contexts nest. Explicit
-start/end pairs can be measured: `meter()` turns them into
-`performance.measure` entries for the profiler.
+Set `debug.stacks = true` to include captured call stacks on `stage` and
+`commit` events.
 
-```js
-debug.meter({ 'temtie:commit': ['commit', 'settled'] });
-```
+## API Reference
 
-The full event and hub types are in `types.d.ts`.
+### `temtie/core.js`
 
-## API
-
-### `mount(container, { builders })`
-
-Creates a mounted target and returns its instance. `builders` maps channel
-names to builder objects.
-
-### `capture()`
-
-Creates a free target reference. It receives channels once it is interpolated
-into a slot that can host it.
-
-### `commit(target)`
-
-Settles the recorded pass for a target and staged or moved children under it.
-
-### `discard(target)`
-
-Voids the target's currently staged pass. Committed output stands.
-
-### `reset(target)`
-
-Stages an empty pass. The next commit clears the target.
-
-The typed surface in `types.d.ts` also covers the `Builder` and `TemplateBuilder`
-contracts, the debug hub, and the template compiler (`compileTemplate` from
-`parser.js`).
+- **`mount(container, builders)`** — mounts a root target on `container` using
+  the `{ [channel]: builder }` map and returns its target instance.
+- **`capture()`** — creates a free target reference; gains builder channels once
+  interpolated into a child or attribute slot.
+- **`commit(target)`** — runs Plan → Apply → Effects for `target` and all staged
+  or moved descendants under it.
+- **`reset(target)`** — stages an empty replacement pass (next `commit()` clears
+  anything not re-emitted).
+- **`amend(target)`** — starts an incremental pass that updates touched segments
+  and appends new ones without dropping untouched segments.
+- **`discard(target)`** — cancels the uncommitted draft on `target`, keeping the
+  committed output intact.
+- **`TEMPLATE_HOLE_TYPES`** — `{ CHILD, ATTR, SPREAD, META }` constants for
+  custom template compilers/builders.
 
 ## License
 
