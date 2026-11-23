@@ -4,22 +4,37 @@
 
 import { compileTemplate } from '../parser.js';
 
-const NODE = Symbol('markup.node');
-
-function markTree(root) {
-  if (!root || typeof root !== 'object') return;
-  const stack = [root];
-  while (stack.length) {
-    const node = stack.pop();
-    node[NODE] = true;
-    if (node.children)
-      for (const child of node.children)
-        if (child && typeof child === 'object') stack.push(child);
-  }
+function el(type) {
+  return { type, children: [], props: {}, parent: null };
 }
 
-function el(type) {
-  return { type, children: [], props: {}, parent: null, [NODE]: true };
+function cloneShallow(node, parent) {
+  if ('text' in node) {
+    const copy = { text: node.text, parent };
+    if ('source' in node) copy.source = node.source;
+    return copy;
+  }
+  if (node.marker) return { marker: true, parent };
+  const copy = { type: node.type, children: [], props: node.props ? { ...node.props } : {}, parent };
+  if (node.sources) copy.sources = { ...node.sources };
+  return copy;
+}
+
+function cloneNode(root) {
+  if (!root || typeof root !== 'object') return root;
+  const rootCopy = cloneShallow(root, null);
+  if (!root.children?.length) return rootCopy;
+  const stack = [root, rootCopy];
+  while (stack.length) {
+    const copy = stack.pop(), node = stack.pop();
+    const kids = node.children, out = copy.children;
+    for (let i = 0; i < kids.length; i++) {
+      const child = kids[i], childCopy = cloneShallow(child, copy);
+      out.push(childCopy);
+      if (child.children?.length) stack.push(child, childCopy);
+    }
+  }
+  return rootCopy;
 }
 
 function spliceRange(start, end) {
@@ -171,19 +186,17 @@ export class MarkupBuilder {
   }
 
   createText(text, source) {
-    const node = { text, parent: null, [NODE]: true };
+    const node = { text, parent: null };
     if (source !== undefined && namesUnknown(source)) node.source = source;
     return node;
   }
 
   createMarker() {
-    return { marker: true, parent: null, [NODE]: true };
+    return { marker: true, parent: null };
   }
 
   clone(node) {
-    const copy = structuredClone(node);
-    markTree(copy);
-    return copy;
+    return cloneNode(node);
   }
 
   resolve(root, path) {
