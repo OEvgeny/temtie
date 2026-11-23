@@ -106,7 +106,7 @@ function makeRef(target, claim = null) {
 function makeTarget(proto) {
   return {
     proto, anchor: null, parent: null, children: new Set(),
-    committed: [], buckets: new Map(), ownerClaim: null, staged: null, dirty: false,
+    committed: [], buckets: new Map(), ownerClaim: null, staged: null, dirty: false, pending: null,
   };
 }
 
@@ -525,15 +525,16 @@ const nextListOf = (draft, committed) => (draft.mode === 'amend'
     ? committed
     : draft.base.slice(0, draft.matched))));
 
-function disposeBodies(roots, endedClaims, errors) {
+function disposeBodies(roots, endedClaims, errors, owner = null, tried = null) {
   if (roots.length) {
-    const disposed = new Set(), sink = { leaving: roots, ended: endedClaims };
+    const disposed = new Set(), sink = { leaving: roots, ended: endedClaims, tried };
     for (let i = 0; i < roots.length; i++) {
       const body = roots[i];
       if (!body || disposed.has(body) || isLiveBody(body)) continue;
       disposed.add(body);
       debug.enabled && debug.emit({ type: 'dispose', target: body });
-      evictSegs(body.committed, null, sink, errors);
+      if (body.pending) { evictSegs(body.pending, owner, null, sink, errors); body.pending = null; }
+      evictSegs(body.committed, owner, null, sink, errors);
       if (body.anchor?.occupant?.body === body) body.anchor.occupant = null;
       body.parent?.children.delete(body);
       body.committed = [];
@@ -687,7 +688,12 @@ function recoverApply(queue, errors) {
     if (node.placed || !node.draft) continue;
     if (node.draft.created)
       for (const seg of node.draft.created)
-        if (!seg.parked) tryStep(errors, () => removeSeg(seg));
+        if (seg.parked === null) {
+          const before = errors.length;
+          tryStep(errors, () => removeSeg(seg));
+          if (errors.length === before) seg.parked = UNSET;
+          else queuePending(node.target, seg);
+        }
     voidOpened(node.target, node.draft.pass);
   }
 }
@@ -715,7 +721,7 @@ function runCommits(commits, errors) {
     claim.committed = next;
     const body = claim.body;
     claim.body = null;
-    runAll(disposeBodies(body ? [body] : [], [claim], errors), errors);
+    runAll(disposeBodies(body ? [body] : [], [claim], errors, claim.owner), errors);
   }
 }
 
@@ -737,7 +743,7 @@ function commitTarget(rootTarget) {
   });
 
   withCause(ev, () => {
-    const applied = { leaving: [], ended: [], commits: [] };
+    const applied = { leaving: [], ended: [], commits: [], tried: null };
     const errors = [];
     let plan = null, releases = null;
     PHASE = PLAN;
@@ -750,7 +756,7 @@ function commitTarget(rootTarget) {
       errors.push(error);
       recoverApply(plan.queue, errors);
     } finally {
-      if (plan) releases = disposeBodies(applied.leaving, applied.ended, errors);
+      if (plan) releases = disposeBodies(applied.leaving, applied.ended, errors, rootTarget, applied.tried);
       PHASE = IDLE;
     }
 
@@ -792,7 +798,34 @@ function parkSegs(initial) {
   }
 }
 
-function evictSegs(initial, liveNodes, applied, errors) {
+function queuePending(owner, seg) {
+  const list = owner.pending ??= [];
+  if (!list.includes(seg)) list.push(seg);
+}
+
+function finishEvict(seg) {
+  for (const binding of seg.bindings) if (binding.end) clearRange(binding);
+  if (seg.parked === null) removeSeg(seg);
+  seg.parked = UNSET;
+}
+
+function drainPending(target, applied) {
+  const pending = target.pending;
+  if (!pending) return;
+  let i = 0;
+  try {
+    for (; i < pending.length; i++) finishEvict(pending[i]);
+  } finally {
+    if (i < pending.length) {
+      (applied.tried ??= new Set()).add(pending[i]);
+      target.pending = pending.slice(i);
+    } else {
+      target.pending = null;
+    }
+  }
+}
+
+function evictSegs(initial, owner, liveNodes, applied, errors) {
   if (!initial.length) return;
   const segs = initial.slice();
   for (let i = 0; i < segs.length; i++) {
@@ -806,24 +839,33 @@ function evictSegs(initial, liveNodes, applied, errors) {
       else if (liveNodes) pushAll(segs, occ.body.committed);
     }
   }
-  for (let i = segs.length - 1; i >= 0; i--) {
-    const seg = segs[i];
-    for (const binding of seg.bindings) {
-      if (!binding.end) continue;
-      if (errors) { tryStep(errors, () => clearRange(binding)); binding.end = null; }
-      else clearRange(binding);
+  let i = segs.length - 1;
+  try {
+    for (; i >= 0; i--) {
+      const seg = segs[i];
+      if (seg.parked === UNSET || applied.tried?.has(seg)) continue;
+      if (errors) {
+        const before = errors.length;
+        tryStep(errors, () => finishEvict(seg));
+        if (errors.length > before) {
+          (applied.tried ??= new Set()).add(seg);
+          if (owner) queuePending(owner, seg);
+        }
+      } else {
+        finishEvict(seg);
+      }
     }
-    const live = seg.parked === null;
-    seg.parked = UNSET;
-    if (!live) continue;
-    if (errors) tryStep(errors, () => removeSeg(seg));
-    else removeSeg(seg);
+  } finally {
+    if (i >= 0) {
+      (applied.tried ??= new Set()).add(segs[i]);
+      if (owner) for (let j = i; j >= 0; j--) if (segs[j].parked !== UNSET) queuePending(owner, segs[j]);
+    }
   }
 }
 
-function vacateBody(body, liveNodes, applied) {
+function vacateBody(body, owner, liveNodes, applied) {
   if (liveNodes.has(body)) parkSegs(body.committed);
-  else evictSegs(body.committed, liveNodes, applied, null);
+  else evictSegs(body.committed, owner, liveNodes, applied, null);
 }
 
 function placeChain(target, anchor, list) {
@@ -898,7 +940,7 @@ function placeSubtree(target, anchor, parent, liveNodes, incomingOcc, recurse) {
   }
 }
 
-function vacateBinding(binding, occ, nextKind, liveNodes, applied) {
+function vacateBinding(binding, occ, nextKind, owner, liveNodes, applied) {
   if (occ.kind === 'plain') {
     if (nextKind !== 'plain') {
       occ.prev = UNSET;
@@ -913,7 +955,7 @@ function vacateBinding(binding, occ, nextKind, liveNodes, applied) {
     if (binding.end) clearRange(binding);
     if (occ.usedHole && nextKind !== 'plain') binding.dest.clear?.(binding);
   }
-  if (occ.body) vacateBody(occ.body, liveNodes, applied);
+  if (occ.body) vacateBody(occ.body, owner, liveNodes, applied);
 }
 
 function reconcileSegments(target, anchor, draft, liveNodes, applied) {
@@ -927,15 +969,24 @@ function reconcileSegments(target, anchor, draft, liveNodes, applied) {
   if (draft.mode !== 'amend') {
     const mark = ++PASS;
     for (const seg of nextList) seg.keepPass = mark;
-    let order = 0, anyDropped = false;
-    for (const seg of committed) {
-      if (seg.keepPass === mark) { seg.oldIndex = order++; continue; }
-      anyDropped = true;
-      debug.enabled && debug.emit({ type: 'drop', target, segment: seg });
-      evictSegs([seg], liveNodes, applied, null);
-      pruneSeg(target, seg);
+    let order = 0, dropped = 0, idx = 0;
+    try {
+      for (; idx < committed.length; idx++) {
+        const seg = committed[idx];
+        if (seg.keepPass === mark) { seg.oldIndex = order++; continue; }
+        dropped++;
+        debug.enabled && debug.emit({ type: 'drop', target, segment: seg });
+        pruneSeg(target, seg);
+        evictSegs([seg], target, liveNodes, applied, null);
+      }
+    } finally {
+      if (dropped) {
+        const rem = [];
+        for (let j = 0; j < committed.length; j++)
+          if (committed[j].keepPass === mark || j > idx) rem.push(committed[j]);
+        target.committed = rem;
+      }
     }
-    if (anyDropped) target.committed = committed.filter((seg) => seg.keepPass === mark);
     if (target.anchor === anchor && !target.dirty) {
       const keepMark = markKeepSet(nextList);
       if (keepMark) {
@@ -961,18 +1012,18 @@ function indexCreated(target, created) {
   }
 }
 
-function applyEdits(edits, liveNodes, applied) {
+function applyEdits(target, edits, liveNodes, applied) {
   for (const [binding, entry] of edits) {
     const cur = binding.occupant;
     if (entry === CLEAR) {
-      if (cur) vacateBinding(binding, cur, null, liveNodes, applied);
+      if (cur) vacateBinding(binding, cur, null, target, liveNodes, applied);
       binding.occupant = null;
       debug.enabled && debug.emit({ type: 'claim', binding, occupant: null });
       continue;
     }
     let occ = cur;
     if (occ?.kind !== 'plain') {
-      if (occ) vacateBinding(binding, occ, 'plain', liveNodes, applied);
+      if (occ) vacateBinding(binding, occ, 'plain', target, liveNodes, applied);
       occ = binding.occupant = { kind: 'plain', prev: UNSET };
       debug.enabled && debug.emit({ type: 'claim', binding, occupant: occ });
     } else {
@@ -983,11 +1034,11 @@ function applyEdits(edits, liveNodes, applied) {
   }
 }
 
-function publishClaims(claims, liveNodes, applied) {
+function publishClaims(target, claims, liveNodes, applied) {
   for (const [binding, claim] of claims) {
     const cur = binding.occupant, isNew = claim.binding === null;
     if (cur !== claim) {
-      if (cur) vacateBinding(binding, cur, 'instance', liveNodes, applied);
+      if (cur) vacateBinding(binding, cur, 'instance', target, liveNodes, applied);
       binding.occupant = claim;
       claim.binding = binding;
       debug.enabled && debug.emit({ type: 'claim', binding, occupant: claim });
@@ -1001,7 +1052,7 @@ function applyOne(node, liveNodes, applied) {
   const { target, anchor, parent, incomingOcc, draft, edits, claims } = node;
 
   if (incomingOcc && !sameOccupant(anchor.occupant, incomingOcc)) {
-    if (anchor.occupant) vacateBinding(anchor, anchor.occupant, incomingOcc.kind, liveNodes, applied);
+    if (anchor.occupant) vacateBinding(anchor, anchor.occupant, incomingOcc.kind, parent ?? target, liveNodes, applied);
     anchor.occupant = null;
   }
   if (target.anchor && target.anchor !== anchor) {
@@ -1009,6 +1060,7 @@ function applyOne(node, liveNodes, applied) {
     if (host.occupant?.body === target) { noteLeaving(host.occupant, applied); host.occupant = null; }
     host.dest.vacate?.(host);
   }
+  if (target.pending) drainPending(target, applied);
 
   if (!draft || node.sealed) {
     placeSubtree(target, anchor, parent, liveNodes, incomingOcc, node.sealed);
@@ -1023,9 +1075,9 @@ function applyOne(node, liveNodes, applied) {
     target.committed = nextList;
     node.placed = true;
     if (draft.created) indexCreated(target, draft.created);
-    if (edits) applyEdits(edits, liveNodes, applied);
+    if (edits) applyEdits(target, edits, liveNodes, applied);
     deliver(target, anchor);
-    if (claims) publishClaims(claims, liveNodes, applied);
+    if (claims) publishClaims(target, claims, liveNodes, applied);
   });
 }
 
