@@ -480,13 +480,18 @@ function markKeepSet(nextList, committed, mark) {
   for (let k = tails[tails.length - 1]; k >= 0; k = prev[k]) segs[k].keepPass = mark;
 }
 
-function runAll(fns, errors) {
-  if (!fns) return;
-  for (const run of fns) {
-    try { run(); }
-    catch (error) { errors.push(error); }
-  }
+function tryStep(errors, fn) {
+  try { fn(); return true; }
+  catch (error) { errors?.push(error); return false; }
 }
+
+function runAll(fns, errors) {
+  if (fns) for (const run of fns) tryStep(errors, run);
+}
+
+const removeSeg = (seg) => {
+  if (seg.builder.parent(seg.start)) seg.builder.remove(seg.start, seg.end);
+};
 
 function throwErrors(errors) {
   if (errors.length === 1) throw errors[0];
@@ -537,7 +542,7 @@ function disposeBodies(roots, endedClaims, errors) {
       for (const seg of body.committed) {
         for (const binding of seg.bindings) {
           if (binding.end) {
-            try { clearRange(binding); } catch (error) { errors.push(error); }
+            tryStep(errors, () => clearRange(binding));
             binding.end = null;
           }
           const occ = binding.occupant;
@@ -546,13 +551,9 @@ function disposeBodies(roots, endedClaims, errors) {
             noteLeaving(occ, sink);
           }
         }
-        if (seg.parked === null) {
-          seg.parked = UNSET;
-          try { if (seg.builder.parent(seg.start)) seg.builder.remove(seg.start, seg.end); }
-          catch (error) { errors.push(error); }
-        } else {
-          seg.parked = UNSET;
-        }
+        const live = seg.parked === null;
+        seg.parked = UNSET;
+        if (live) tryStep(errors, () => removeSeg(seg));
       }
       if (body.anchor?.occupant?.body === body) body.anchor.occupant = null;
       body.parent?.children.delete(body);
@@ -618,7 +619,7 @@ function planCommit(rootTarget, rootAnchor, rootParent) {
     }
   };
 
-  let i = 0;
+  let i = 0, stagingRef = null;
   try {
     for (; i < queue.length; i++) {
       const node = queue[i], target = node.target;
@@ -661,13 +662,9 @@ function planCommit(rootTarget, rootAnchor, rootParent) {
           claim.next = raw;
           const stageFn = stageOf(spec);
           if (stageFn) {
-            const ref = claim.ref ??= makeRef(null, claim);
-            try {
-              stageFn(ref.inst, claim.staged === UNSET ? undefined : claim.staged, raw);
-            } catch (error) {
-              if (ref.target?.staged) ref.target.staged = null;
-              throw error;
-            }
+            const ref = stagingRef = claim.ref ??= makeRef(null, claim);
+            stageFn(ref.inst, claim.staged === UNSET ? undefined : claim.staged, raw);
+            stagingRef = null;
           }
           const body = claim.body ?? activeLazyBody(claim);
           if (body) {
@@ -703,12 +700,12 @@ function planCommit(rootTarget, rootAnchor, rootParent) {
     }
 
     return { rootNode, nodes, queue };
-  } catch (error) {
+  } finally {
+    if (stagingRef?.target?.staged) stagingRef.target.staged = null;
     for (let j = i + 1; j < queue.length; j++) {
       const t = queue[j].target;
       if (t.staged && !t.staged.sealed) t.staged = null;
     }
-    throw error;
   }
 }
 
@@ -731,28 +728,25 @@ function commitTarget(rootTarget) {
 
   withCause(ev, () => {
     const applied = { leaving: [], ended: [], commits: [] };
-    let releases, applyErrors = null;
+    let plan = null, releases = null, applyErrors = null;
     PHASE = PLAN;
     try {
-      const plan = planCommit(rootTarget, rootAnchor, rootParent);
+      plan = planCommit(rootTarget, rootAnchor, rootParent);
       PHASE = APPLY;
-      try {
-        applyPlan(plan.rootNode, plan.nodes, applied);
-        const disposeErrors = [];
-        releases = disposeBodies(applied.leaving, applied.ended, disposeErrors);
-        if (disposeErrors.length) applyErrors = disposeErrors;
-      } catch (error) {
-        PHASE = IDLE;
-        for (const node of plan.queue) {
-          if (!node.placed && node.draft?.created)
-            for (const seg of node.draft.created)
-              if (!seg.parked)
-                try { if (seg.builder.parent(seg.start)) seg.builder.remove(seg.start, seg.end); } catch {}
-          if (!node.placed && node.draft) voidOpened(node.target, node.draft.pass);
-        }
-        applyErrors = [error];
-        releases = disposeBodies(applied.leaving, applied.ended, applyErrors);
+      applyPlan(plan.rootNode, plan.nodes, applied);
+      const disposeErrors = [];
+      releases = disposeBodies(applied.leaving, applied.ended, disposeErrors);
+      if (disposeErrors.length) applyErrors = disposeErrors;
+    } catch (error) {
+      if (!plan) throw error;
+      for (const node of plan.queue) {
+        if (!node.placed && node.draft?.created)
+          for (const seg of node.draft.created)
+            if (!seg.parked) tryStep(null, () => removeSeg(seg));
+        if (!node.placed && node.draft) voidOpened(node.target, node.draft.pass);
       }
+      applyErrors = [error];
+      releases = disposeBodies(applied.leaving, applied.ended, applyErrors);
     } finally {
       PHASE = IDLE;
     }
@@ -765,28 +759,21 @@ function commitTarget(rootTarget) {
     for (const { claim, next, isNew } of applied.commits) {
       if (!claim.alive) continue;
       const prev = claim.committed === UNSET ? undefined : claim.committed;
-      let ok = false;
       ACTIVE_CLAIMS.add(claim);
-      try {
+      const ok = tryStep(errors, () => {
         claim.spec.commit(handleOf(claim), prev, next);
         claim.committed = next;
-        ok = true;
-      } catch (error) {
-        errors.push(error);
-      } finally {
-        ACTIVE_CLAIMS.delete(claim);
-      }
-      if (!ok) {
+      });
+      ACTIVE_CLAIMS.delete(claim);
+      if (!ok && isNew && claim.binding.occupant === claim) {
         const binding = claim.binding;
-        if (isNew && binding.occupant === claim) {
-          if (binding.end) try { clearRange(binding); } catch {}
-          if (claim.usedHole) try { binding.dest.clear?.(binding); } catch {}
-          binding.occupant = null;
-          claim.committed = next;
-          const body = claim.body;
-          claim.body = null;
-          runAll(disposeBodies(body ? [body] : [], [claim], errors), errors);
-        }
+        if (binding.end) tryStep(null, () => clearRange(binding));
+        if (claim.usedHole) tryStep(null, () => binding.dest.clear?.(binding));
+        binding.occupant = null;
+        claim.committed = next;
+        const body = claim.body;
+        claim.body = null;
+        runAll(disposeBodies(body ? [body] : [], [claim], errors), errors);
       }
     }
 
@@ -853,7 +840,7 @@ function dropSeg(rootSeg, liveNodes, applied) {
     for (const binding of seg.bindings) if (binding.end) clearRange(binding);
     const live = seg.parked === null;
     seg.parked = UNSET;
-    if (live && seg.builder.parent(seg.start)) seg.builder.remove(seg.start, seg.end);
+    if (live) removeSeg(seg);
   }
 }
 
