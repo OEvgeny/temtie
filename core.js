@@ -24,6 +24,8 @@ const IDLE = 0, PLAN = 1, APPLY = 2;
 let PASS = 0;
 let PHASE = IDLE;
 let PLAN_NODES = null;
+let PLAN_ROOT = null;
+let PLAN_PENDING = null;
 
 // SameValueZero. NaN equals NaN.
 const same = (a, b) => a === b || (a !== a && b !== b);
@@ -70,8 +72,9 @@ export function commit(inst) {
 export function discard(inst) {
   const target = targetOf(inst, 'discard');
   if (!target?.staged) return;
-  dropOpened(target, target.staged.pass);
-  target.staged = null;
+  const draft = target.staged;
+  clearStaged(target);
+  dropOpened(target, draft.pass, draft);
   debug.enabled && debug.emit({ type: 'call', target, pass: ++PASS, via: 'discard' });
 }
 
@@ -106,7 +109,7 @@ function makeRef(target, claim = null) {
 function makeTarget(proto) {
   return {
     proto, anchor: null, parent: null, children: new Set(),
-    committed: [], buckets: new Map(), ownerClaim: null, staged: null, dirty: false, pending: null,
+    committed: [], buckets: new Map(), ownerClaim: null, staged: null, stagedRefs: 0, dirty: false, pending: null,
   };
 }
 
@@ -125,10 +128,24 @@ function targetOf(inst, name, materialize = false) {
   return refTarget(ref, materialize);
 }
 
+function dropDraft(draft) {
+  if (draft?.children) for (const child of draft.children) child.stagedRefs--;
+}
+
+function clearStaged(target) {
+  if (!target.staged) return;
+  dropDraft(target.staged);
+  target.staged = null;
+}
+
 function beginDraft(target, mode, via) {
-  if (target.staged) dropOpened(target, target.staged.pass);
+  if (target.staged) {
+    const prev = target.staged;
+    clearStaged(target);
+    dropOpened(target, prev.pass, prev);
+  }
   const draft = target.staged = {
-    mode, pass: ++PASS, base: target.committed,
+    mode, pass: ++PASS, base: PLAN_NODES && isDyingInPlan(target) ? [] : target.committed,
     matched: 0, list: null, edits: null, used: null, created: null, createdKeys: null,
     children: null,
   };
@@ -136,7 +153,7 @@ function beginDraft(target, mode, via) {
   return draft;
 }
 
-function dropOpened(root, since, rootDraft = root.staged, until = Infinity) {
+function dropOpened(root, since, rootDraft = root.staged, until = Infinity, keepPass = Infinity) {
   const seen = new Set([root]), queue = [root];
   const visit = (child) => {
     if (seen.has(child)) return;
@@ -146,11 +163,12 @@ function dropOpened(root, since, rootDraft = root.staged, until = Infinity) {
   for (let i = 0; i < queue.length; i++) {
     const cur = queue[i];
     const draft = i === 0 ? rootDraft : cur.staged;
+    if (i > 0 && draft && draft.pass > since && draft.pass <= until && !(draft.pass > keepPass && cur.stagedRefs > 0))
+      clearStaged(cur);
     for (const child of cur.children) visit(child);
     if (draft?.children)
       for (const child of draft.children)
-        if (!child.anchor && !liveClaimOf(child)) visit(child);
-    if (i > 0 && cur.staged && cur.staged.pass > since && cur.staged.pass <= until) cur.staged = null;
+        if (!child.anchor && !liveClaimOf(child) && !child.stagedRefs) visit(child);
   }
 }
 
@@ -177,27 +195,34 @@ function compile(builder, strings, target, pass) {
   return site;
 }
 
+function isUnder(target, root) {
+  for (let cur = target; cur; cur = cur.parent ?? liveClaimOf(cur)?.owner ?? null)
+    if (cur === root) return true;
+  return false;
+}
+
+const isExternal = (target, root) => !!(target.anchor || liveClaimOf(target)) && !isUnder(target, root);
+
+function isDyingInPlan(target) {
+  if (PLAN_NODES.has(target)) return false;
+  for (let cur = target; cur; cur = cur.parent) {
+    if (PLAN_PENDING?.has(cur)) return false;
+    if (cur === PLAN_ROOT) return true;
+  }
+  return false;
+}
+
 function isDroppedInPlan(target, seg) {
-  const draft = PLAN_NODES?.get(target)?.draft;
+  const node = PLAN_NODES.get(target);
+  if (!node) return isDyingInPlan(target);
+  if (node.placed) return false;
+  const draft = node.draft;
   return !!draft && draft.mode !== 'amend' && !nextListOf(draft, target.committed).includes(seg);
 }
 
-function isLeavingInPlan(parent, binding, body) {
-  const pEdits = PLAN_NODES.get(parent)?.draft?.edits;
-  if (pEdits) {
-    if (pEdits.has(binding)) {
-      const entry = pEdits.get(binding);
-      if (entry?.[STAGED] !== 'body' || entry.body !== body) return true;
-    }
-    for (const [b, entry] of pEdits)
-      if (b !== binding && entry?.[STAGED] === 'body' && entry.body === body) return true;
-  }
-  const bNode = PLAN_NODES.get(body);
-  if (bNode && bNode.anchor !== binding) return true;
-  for (const node of PLAN_NODES.values())
-    if (node.target !== parent && (node.draft?.children?.has(body) || node.target.staged?.children?.has(body)))
-      return true;
-  return false;
+function isLeavingInPlan(binding, body) {
+  const node = PLAN_NODES.get(body);
+  return node ? node.anchor !== binding : isDyingInPlan(body);
 }
 
 function makeChannel(builder) {
@@ -375,7 +400,7 @@ function resolveSegment(target, draft, seg, values) {
       }
     }
     const occ = binding.occupant;
-    if (!PLAN_NODES && (occ ? (occ.kind === 'plain' && same(occ.prev, raw)) : !binding.dest.write)) {
+    if (PHASE === IDLE && (occ ? (occ.kind === 'plain' && same(occ.prev, raw)) : !binding.dest.write)) {
       edits?.delete(binding);
       continue;
     }
@@ -390,14 +415,15 @@ function resolveBody(parent, draft, seg, binding, ref, values) {
   const occ = binding.occupant;
   const child = refTarget(ref, !!ref.claim)
     ?? (occ?.kind === 'body' && !carried(occ.body, seg, values) && !draft.children?.has(occ.body)
-      && (!PLAN_NODES || !isLeavingInPlan(parent, binding, occ.body)) ? occ.body : null)
+      && (!PLAN_NODES || !isLeavingInPlan(binding, occ.body)) ? occ.body : null)
     ?? makeTarget(parent.proto);
 
   if (ref.target !== child) {
     ref.target = child;
     Object.setPrototypeOf(ref.inst, child.proto);
   }
-  (draft.children ??= new Set()).add(child);
+  const children = draft.children ??= new Set();
+  if (!children.has(child)) { children.add(child); child.stagedRefs++; }
   return child;
 }
 
@@ -552,7 +578,7 @@ const nextListOf = (draft, committed) => (draft.mode === 'amend'
     ? committed
     : draft.base.slice(0, draft.matched))));
 
-function disposeBodies(roots, endedClaims, errors, owner = null, tried = null) {
+function disposeBodies(roots, endedClaims, errors, owner = null, tried = null, keepAfter = Infinity) {
   if (roots.length) {
     const disposed = new Set(), sink = { leaving: roots, ended: endedClaims, tried };
     for (let i = 0; i < roots.length; i++) {
@@ -569,7 +595,8 @@ function disposeBodies(roots, endedClaims, errors, owner = null, tried = null) {
       body.buckets.clear();
       body.children.clear();
       body.dirty = false;
-      body.staged = body.anchor = body.parent = null;
+      if (body.staged && body.staged.pass <= keepAfter) clearStaged(body);
+      body.anchor = body.parent = null;
     }
   }
   if (!endedClaims.length) return null;
@@ -620,14 +647,14 @@ function claimFor(target, binding, spec, raw) {
 }
 
 // Pass 1 (DOM-free): detach drafts, expand pure contract stage(), resolve canonical ownership.
-function planCommit(rootTarget, rootAnchor, rootParent) {
+function planCommit(rootTarget, rootAnchor, rootParent, planPass) {
   const makeNode = (target, anchor, parent) => ({
     target, anchor, parent, ownerNode: null, incomingOcc: null,
     draft: null, edits: null, claims: null, children: null, placed: false,
   });
   const rootNode = makeNode(rootTarget, rootAnchor, rootParent);
   const nodes = new Map([[rootTarget, rootNode]]);
-  const queue = [rootNode];
+  const queue = [rootNode], stages = [], expanded = [];
 
   const attachChild = (body, binding, parentNode, incomingOcc) => {
     const parent = parentNode.target;
@@ -654,40 +681,50 @@ function planCommit(rootTarget, rootAnchor, rootParent) {
     }
   };
 
-  let i = 0, stagingRef = null, failPass = Infinity, ok = false;
+  let i = 0, s = 0, ok = false;
   PLAN_NODES = nodes;
+  PLAN_ROOT = rootTarget;
   try {
-    for (; i < queue.length; i++) {
-      const node = queue[i], target = node.target;
+    for (;;) {
+      for (; i < queue.length; i++) {
+        const node = queue[i], target = node.target;
 
-      // detach before any user hook runs: reentrant recording starts a separate draft
-      const draft = target.staged;
-      if (draft) { target.staged = null; node.draft = draft; }
-      for (const child of target.children)
-        if (!draft || ((draft.mode === 'amend' || child.anchor.seg.seenPass === draft.pass) && !draft.edits?.has(child.anchor)))
-          attachChild(child, child.anchor, node, null);
-      if (!draft?.edits) continue;
+        // detach all queued drafts before user stage() hooks run so reentrant recording starts a separate draft
+        const draft = target.staged;
+        if (draft) { target.staged = null; node.draft = draft; }
+        for (const child of target.children)
+          if (!draft || ((draft.mode === 'amend' || child.anchor.seg.seenPass === draft.pass) && !draft.edits?.has(child.anchor)))
+            attachChild(child, child.anchor, node, null);
+        if (!draft?.edits) continue;
 
-      const edits = node.edits = new Map(draft.edits);
-      for (const [binding, entry] of edits) {
-        checkReentry(ACTIVE_CLAIMS.size && ACTIVE_CLAIMS.has(binding.occupant));
-        const tag = entry?.[STAGED];
-        if (!tag) continue;
-        edits.delete(binding);
-        if (tag === 'body') { attachChild(entry.body, binding, node, entry); continue; }
-
-        const claim = claimFor(target, binding, entry.spec, entry.raw);
-        const stageFn = stageOf(entry.spec);
-        if (stageFn) {
-          const ref = stagingRef = claim.ref ??= makeRef(null, claim);
-          failPass = PASS;
-          stageFn(ref.inst, claim.staged === UNSET ? undefined : claim.staged, entry.raw);
-          failPass = Infinity;
-          stagingRef = null;
+        const edits = node.edits = new Map(draft.edits);
+        for (const [binding, entry] of edits) {
+          checkReentry(ACTIVE_CLAIMS.size && ACTIVE_CLAIMS.has(binding.occupant));
+          const tag = entry?.[STAGED];
+          if (!tag) continue;
+          edits.delete(binding);
+          if (tag === 'body') { attachChild(entry.body, binding, node, entry); continue; }
+          const cur = binding.occupant;
+          if (cur?.kind === 'instance' && cur.spec === entry.spec && cur.alive && cur.body)
+            (PLAN_PENDING ??= new Set()).add(cur.body);
+          stages.push([node, binding, entry]);
         }
-        const body = claim.body ?? activeLazyBody(claim);
-        if (body) attachChild(body, binding, node, claim);
-        else (node.claims ??= []).push([binding, claim]);
+      }
+      if (s >= stages.length) break;
+      const [node, binding, entry] = stages[s++];
+      const claim = claimFor(node.target, binding, entry.spec, entry.raw);
+      const stageFn = stageOf(entry.spec);
+      if (stageFn) {
+        const ref = claim.ref ??= makeRef(null, claim);
+        expanded.push(ref);
+        stageFn(ref.inst, claim.staged === UNSET ? undefined : claim.staged, entry.raw);
+      }
+      const body = claim.body ?? activeLazyBody(claim);
+      if (body) {
+        PLAN_PENDING?.delete(body);
+        attachChild(body, binding, node, claim);
+      } else {
+        (node.claims ??= []).push([binding, claim]);
       }
     }
 
@@ -699,23 +736,60 @@ function planCommit(rootTarget, rootAnchor, rootParent) {
     ok = true;
     return { rootNode, nodes, queue };
   } finally {
-    PLAN_NODES = null;
+    PLAN_PENDING = null;
     if (!ok) {
-      if (stagingRef?.target?.staged) {
-        dropOpened(stagingRef.target, 0);
-        stagingRef.target.staged = null;
+      PLAN_NODES = PLAN_ROOT = null;
+      const expandedTargets = new Set(), drops = [];
+      for (const ref of expanded) {
+        const st = ref.target;
+        if (!st) continue;
+        expandedTargets.add(st);
+        const stNode = nodes.get(st), d = stNode?.draft ?? st.staged;
+        if (stNode?.draft) { dropDraft(stNode.draft); stNode.draft = null; }
+        if (st.staged) clearStaged(st);
+        drops.push([st, d, Infinity]);
       }
+      const kept = new Set(), saved = new Map();
       for (let j = 0; j < queue.length; j++) {
         const node = queue[j], t = node.target;
-        const d = node.draft ?? (t.staged?.pass <= failPass ? t.staged : null);
-        dropOpened(t, 0, d, failPass);
-        if (t.staged && t.staged.pass <= failPass) t.staged = null;
+        if (isExternal(t, rootTarget)) {
+          kept.add(node);
+          if (node.draft) {
+            if (!t.staged) t.staged = node.draft;
+            else dropDraft(node.draft);
+            node.draft = null;
+          }
+          continue;
+        }
+        const d = node.draft ?? (t.staged?.pass <= planPass ? t.staged : null);
+        if (d) saved.set(node, d);
+        if (node.draft) { dropDraft(node.draft); node.draft = null; }
+        if (t.staged && t.staged.pass <= planPass) clearStaged(t);
       }
+      for (let changed = true; changed;) {
+        changed = false;
+        for (const [node, d] of saved) {
+          const t = node.target;
+          if (kept.has(node) || expandedTargets.has(t) || !t.stagedRefs) continue;
+          kept.add(node);
+          changed = true;
+          if (!t.staged) {
+            t.staged = d;
+            if (d.children) for (const c of d.children) c.stagedRefs++;
+          }
+        }
+      }
+      for (let j = 0; j < queue.length; j++) {
+        const node = queue[j];
+        if (!kept.has(node)) drops.push([node.target, saved.get(node) ?? null, planPass]);
+      }
+      for (const [t, d, until] of drops) dropOpened(t, 0, d, until, planPass);
     }
   }
 }
 
 function recoverApply(queue, errors, rootTarget, applied) {
+  for (const node of queue) if (node.draft) dropDraft(node.draft);
   for (const node of queue) {
     if (node.placed || !node.draft) continue;
     if (node.draft.created) {
@@ -773,19 +847,21 @@ function commitTarget(rootTarget) {
 
   withCause(ev, () => {
     const applied = { leaving: [], ended: [], commits: [], tried: null };
-    const errors = [];
+    const errors = [], planPass = PASS;
     let plan = null, releases = null;
     PHASE = PLAN;
     try {
-      plan = planCommit(rootTarget, rootAnchor, rootParent);
+      plan = planCommit(rootTarget, rootAnchor, rootParent, planPass);
       PHASE = APPLY;
       applyPlan(plan.rootNode, plan.nodes, applied);
+      for (const node of plan.queue) if (node.draft) dropDraft(node.draft);
     } catch (error) {
       if (!plan) throw error;
       errors.push(error);
       recoverApply(plan.queue, errors, rootTarget, applied);
     } finally {
-      if (plan) releases = disposeBodies(applied.leaving, applied.ended, errors, rootTarget, applied.tried);
+      PLAN_NODES = PLAN_ROOT = null;
+      if (plan) releases = disposeBodies(applied.leaving, applied.ended, errors, rootTarget, applied.tried, planPass);
       PHASE = IDLE;
     }
 
