@@ -19,7 +19,6 @@ export const TEMPLATE_HOLE_TYPES = {
 };
 const HOLE = TEMPLATE_HOLE_TYPES;
 const IDLE = 0, APPLY = 1, EFFECTS = 2;
-const EMPTY_LIST = Object.freeze([]);
 const STAGING = new Set();
 
 let PASS = 0;
@@ -99,15 +98,9 @@ export function commit(inst) {
 
     PHASE = APPLY;
     try {
-      applyPlan(plan.rootNode, plan.liveTargets, applied);
-    } catch (error) {
-      errors.push(error);
-    } finally {
-      releases = disposeBodies(applied.leaving, applied.ended);
+      tryStep(errors, () => applyPlan(plan.rootNode, plan.liveTargets, applied));
+      tryStep(errors, () => { releases = disposeBodies(applied.leaving, applied.ended, errors); });
       PHASE = EFFECTS;
-    }
-
-    try {
       const applyFailed = errors.length > 0;
       if (releases) for (const run of releases) tryStep(errors, run);
       if (!applyFailed) {
@@ -242,11 +235,10 @@ function discardDraft(rootDraft) {
   }
 }
 
-function makeDraft(ref, mode, target = ref.target, tentative = !!(target && target.owner !== ref)) {
+function makeDraft(ref, mode, target = ref.target, tentative = target.owner !== ref) {
   return {
     ref, mode, pass: ++PASS,
-    base: target ? target.committed : EMPTY_LIST,
-    baseRev: target ? target.rev : 0,
+    base: target.committed, baseRev: target.rev,
     tentative, matched: 0, list: null, edits: null,
     used: null, created: null, seenKeys: null,
     children: null, calls: tentative ? [] : null,
@@ -339,13 +331,12 @@ function makeChannel(builder) {
     appendSegment(draft, seg);
 
     STAGING.add(ref);
-    let slots;
     try {
-      slots = withCause(ev, () => resolveSegment(ref, draft, seg, values));
+      withCause(ev, () => resolveSegment(ref, draft, seg, values));
     } finally {
       STAGING.delete(ref);
     }
-    if (slots) draft.calls.push({ seg, slots });
+    if (draft.calls) draft.calls.push(seg);
   };
 }
 
@@ -435,12 +426,8 @@ const DEST = {
 
 function resolveSegment(ref, draft, seg, values) {
   const target = ref.target;
-  const slots = draft.tentative ? [] : null;
   let edits = draft.edits;
-  const setSlot = (binding, entry) => {
-    (edits ??= draft.edits = new Map()).set(binding, entry);
-    slots?.push(entry);
-  };
+  const setSlot = (binding, entry) => (edits ??= draft.edits = new Map()).set(binding, entry);
 
   for (const binding of seg.bindings) {
     const raw = values[binding.slot];
@@ -465,7 +452,6 @@ function resolveSegment(ref, draft, seg, values) {
     }
     setSlot(binding, val);
   }
-  return slots;
 }
 
 function resolveBody(parentTarget, draft, binding, childRef) {
@@ -595,7 +581,7 @@ function isLiveBody(body) {
   return false;
 }
 
-function disposeBodies(roots, endedClaims) {
+function disposeBodies(roots, endedClaims, errors) {
   if (roots.length) {
     const disposed = new Set(), sink = { leaving: roots, ended: endedClaims };
     for (let i = 0; i < roots.length; i++) {
@@ -603,12 +589,11 @@ function disposeBodies(roots, endedClaims) {
       if (!body || disposed.has(body) || isLiveBody(body)) continue;
       disposed.add(body);
       debug.enabled && debug.emit({ type: 'dispose', target: body });
-      evictSegs(body.committed, null, sink);
+      retireBody(body, null, sink, errors);
       if (body.anchor?.occupant?.body === body) body.anchor.occupant = null;
       body.parent?.children.delete(body);
       if (body.owner?.target === body) releaseOwner(body.owner);
       body.owner = null;
-      body.committed = [];
       body.buckets.clear();
       body.children.clear();
       body.anchor = body.parent = null;
@@ -639,11 +624,11 @@ function replayDraft(node, newTarget, byRef) {
   const edits = new Map();
   const overwritten = orig.mode === 'amend' && node.children ? new Set() : null;
 
-  for (const { seg: origSeg, slots } of orig.calls) {
+  for (const origSeg of orig.calls) {
     const seg = pickSegment(newTarget, rDraft, origSeg.site, origSeg.keyed, origSeg.key);
     appendSegment(rDraft, seg);
     for (let i = 0; i < seg.bindings.length; i++) {
-      const oldB = origSeg.bindings[i], newB = seg.bindings[i], entry = slots[i];
+      const oldB = origSeg.bindings[i], newB = seg.bindings[i], entry = orig.edits.get(oldB);
       overwritten?.add(newB);
       const tag = entry?.[STAGED], childRef = tag === 'body' ? entry.ref : (tag ? entry.stageRef : null);
       if (!childRef) { edits.set(newB, entry); continue; }
@@ -801,7 +786,14 @@ function parkSegs(target) {
   }
 }
 
-function evictSegs(initial, liveTargets, applied) {
+function retireBody(body, liveTargets, applied, errors) {
+  if (!body.committed.length) return;
+  const segs = body.committed;
+  body.committed = [];
+  evictSegs(segs, liveTargets, applied, errors);
+}
+
+function evictSegs(initial, liveTargets, applied, errors = null) {
   if (!initial.length) return;
   const segs = initial.slice();
   for (let i = 0; i < segs.length; i++) {
@@ -812,13 +804,19 @@ function evictSegs(initial, liveTargets, applied) {
       noteLeaving(occ, applied);
       if (!occ.body) continue;
       if (liveTargets?.has(occ.body)) parkSegs(occ.body);
-      else for (const s of occ.body.committed) segs.push(s);
+      else {
+        for (const s of occ.body.committed) segs.push(s);
+        occ.body.committed = [];
+      }
     }
   }
   for (let i = segs.length - 1; i >= 0; i--) {
-    const seg = segs[i];
-    if (!seg.parked && seg.builder.parent(seg.start)) seg.builder.remove(seg.start, seg.end);
+    const seg = segs[i], parked = seg.parked;
     seg.parked = null;
+    if (parked) continue;
+    const remove = () => { if (seg.builder.parent(seg.start)) seg.builder.remove(seg.start, seg.end); };
+    if (errors) tryStep(errors, remove);
+    else remove();
   }
 }
 
@@ -859,7 +857,7 @@ function vacateBinding(binding, occ, nextKind, liveTargets, applied) {
   if (occ.kind === 'instance' && occ.usedHole && nextKind !== 'plain') binding.dest.clear(binding);
   if (!occ.body) return;
   if (liveTargets?.has(occ.body)) parkSegs(occ.body);
-  else evictSegs(occ.body.committed, liveTargets, applied);
+  else retireBody(occ.body, liveTargets, applied);
 }
 
 function setOccupant(binding, next, liveTargets, applied) {
