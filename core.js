@@ -206,42 +206,41 @@ function releaseOwner(ref) {
   setTarget(ref, null);
 }
 
-function hasAncestor(draft, targetRef) {
-  const seen = new Set([draft.ref]), stack = [draft.ref];
-  for (let i = 0; i < stack.length; i++) {
-    const ref = stack[i];
-    if (ref === targetRef) return true;
-    if (ref.owners) for (const p of ref.owners) if (!seen.has(p.ref)) { seen.add(p.ref); stack.push(p.ref); }
-  }
-  return false;
-}
-
 function linkChild(parentDraft, childRef) {
-  if (parentDraft.ref === childRef) return;
   if (isOwnedAnchored(childRef) && !childRef.owners?.size
     && (childRef.draft || childRef.target.parent !== parentDraft.ref.target)) return;
-  if (childRef.draft?.children?.size && hasAncestor(parentDraft, childRef)) return;
   (parentDraft.children ??= new Set()).add(childRef);
   (childRef.owners ??= new Set()).add(parentDraft);
 }
 
 function discardDraft(rootDraft) {
-  const queue = [rootDraft];
+  const dead = new Set([rootDraft]), refs = new Set([rootDraft.ref]), queue = [rootDraft];
   for (let i = 0; i < queue.length; i++) {
-    const d = queue[i];
-    if (d.ref.draft === d) d.ref.draft = null;
-    if (d.children) {
-      for (const child of d.children) {
-        child.owners?.delete(d);
-        if (!child.owners?.size) {
-          if (child.draft) queue.push(child.draft);
-          else detachRef(child);
-        }
+    const children = queue[i].children;
+    if (!children) continue;
+    for (const child of children) {
+      refs.add(child);
+      if (child.draft && !dead.has(child.draft)) {
+        dead.add(child.draft);
+        queue.push(child.draft);
       }
-      d.children = null;
     }
-    if (!d.ref.owners?.size && !d.ref.draft) detachRef(d.ref);
   }
+  const keep = [];
+  for (const ref of refs)
+    if (ref.owners) for (const p of ref.owners) if (!dead.has(p)) { keep.push(ref); break; }
+  for (let i = 0; i < keep.length; i++) {
+    const d = keep[i].draft;
+    if (!d || d === rootDraft || !dead.has(d)) continue;
+    dead.delete(d);
+    if (d.children) for (const child of d.children) keep.push(child);
+  }
+  for (const d of dead) {
+    if (d.ref.draft === d) d.ref.draft = null;
+    dropFrom(d.children, 'owners', d);
+    d.children = null;
+  }
+  for (const ref of refs) if (!ref.owners?.size && !ref.draft) detachRef(ref);
 }
 
 function makeDraft(ref, mode, target = ref.target, tentative = target.owner !== ref) {
