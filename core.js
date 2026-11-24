@@ -25,10 +25,9 @@ let PHASE = IDLE;
 
 const same = (a, b) => a === b || (a !== a && b !== b);
 const carriesIdentity = (key) => key !== undefined && key !== null && key !== true && key !== false;
-const sameOccupant = (a, b) => a === b || (a?.kind === 'body' && b?.kind === 'body' && a.body === b.body);
-const isOwnedAnchored = (ref) => !!(ref.target?.anchor && ref.target.owner === ref);
+const ownsTarget = (ref) => ref.target?.owner === ref;
+const isOwnedAnchored = (ref) => ownsTarget(ref) && !!ref.target.anchor;
 const coerceChild = (value) => (value == null || value === false ? '' : String(value));
-const commitOf = (spec) => (typeof spec === 'function' ? null : spec.commit);
 
 function assertCanStage(op) {
   if (PHASE === APPLY) throw new Error(`temtie/core: cannot ${op} while a commit is applying`);
@@ -57,7 +56,7 @@ export function mount(container, builders) {
   const ref = makeRef(target);
   target.owner = ref;
   target.anchor = host;
-  host.occupant = { kind: 'body', body: target };
+  host.occupant = target.occ;
 
   debug.enabled && debug.emit({ type: 'mount', target, container, builders: Object.keys(builders) });
   return ref.inst;
@@ -107,11 +106,13 @@ export function commit(inst) {
       tryStep(errors, () => disposeBodies(applied, errors));
       PHASE = EFFECTS;
       const applyFailed = errors.length > 0;
-      for (const claim of applied.releases) tryStep(errors, () => {
-        const release = typeof claim.spec === 'function' ? null : claim.spec.release;
-        const cur = commitOf(claim.spec) ? claim.committed : claim.staged;
-        if (release && cur !== UNSET) release(handleOf(claim), cur);
-      });
+      for (const claim of applied.releases) {
+        debug.enabled && debug.emit({ type: 'end', binding: claim.binding, occupant: claim });
+        tryStep(errors, () => {
+          if (claim.spec.release && claim.committed !== UNSET)
+            claim.spec.release(handleOf(claim), claim.committed);
+        });
+      }
       if (!applyFailed) {
         for (const { claim, next } of applied.commits) {
           if (!claim.alive) continue;
@@ -168,10 +169,12 @@ function makeRef(target) {
 }
 
 function makeTarget(proto, owner = null) {
-  return {
-    proto, owner, anchor: null, parent: null, children: new Set(),
+  const target = {
+    proto, owner, occ: null, anchor: null, parent: null, children: new Set(),
     committed: [], buckets: new Map(), rev: 0,
   };
+  target.occ = { kind: 'body', body: target };
+  return target;
 }
 
 function refOf(inst, name) {
@@ -561,10 +564,10 @@ const nextListOf = (draft, committed) => (draft.mode === 'amend'
 
 function noteLeaving(occ, applied) {
   if (occ.body) applied.leaving.push(occ.body);
-  if (occ.kind !== 'instance' || !occ.alive) return;
-  occ.alive = false;
-  debug.enabled && debug.emit({ type: 'end', binding: occ.binding, occupant: occ });
-  applied.releases.push(occ);
+  if (occ.kind === 'instance' && occ.alive) {
+    occ.alive = false;
+    applied.releases.push(occ);
+  }
 }
 
 function isLiveBody(body) {
@@ -820,7 +823,7 @@ function vacateBinding(binding, occ, nextKind, liveTargets, applied) {
 
 function setOccupant(binding, next, liveTargets, applied) {
   const cur = binding.occupant;
-  if (sameOccupant(cur, next)) return cur;
+  if (cur === next) return cur;
   if (cur) vacateBinding(binding, cur, next?.kind ?? null, liveTargets, applied);
   binding.occupant = next;
   if (next?.kind === 'instance') next.binding = binding;
@@ -830,18 +833,8 @@ function setOccupant(binding, next, liveTargets, applied) {
 
 function enqueueCommit(claim, next, applied) {
   claim.staged = next;
-  if (commitOf(claim.spec)) applied.commits.push({ claim, next });
-}
-
-function bindTarget(target, anchor, parent, incoming) {
-  if (target.parent && target.parent !== parent) target.parent.children.delete(target);
-  target.anchor = anchor;
-  target.parent = parent;
-  parent?.children.add(target);
-  if (incoming) {
-    setOccupant(anchor, incoming, null, null);
-    if (incoming.kind === 'instance') incoming.body = target;
-  }
+  if (claim.spec.commit) applied.commits.push({ claim, next });
+  else claim.committed = next;
 }
 
 function reconcileSegments(target, anchor, draft, liveTargets, applied) {
@@ -911,7 +904,7 @@ function applyEdits(node, byRef, liveTargets, applied) {
 
 function applyOne(node, byRef, liveTargets, applied) {
   const { ref, target, anchor, entry, draft } = node;
-  const incoming = entry && (entry.claim ?? { kind: 'body', body: target });
+  const incoming = entry && (entry.claim ?? target.occ);
   const parent = node.parentNode ? node.parentNode.target : target.parent;
 
   if (target.owner !== ref) {
@@ -920,7 +913,7 @@ function applyOne(node, byRef, liveTargets, applied) {
     setTarget(ref, target);
   }
 
-  if (incoming && !sameOccupant(anchor.occupant, incoming)) {
+  if (incoming && anchor.occupant !== incoming) {
     const cur = anchor.occupant;
     if (cur) {
       if (cur.body === target) noteLeaving(cur, applied);
@@ -930,7 +923,7 @@ function applyOne(node, byRef, liveTargets, applied) {
   }
   if (target.anchor && target.anchor !== anchor) {
     const host = target.anchor;
-    if (host.occupant?.body === target) { noteLeaving(host.occupant, applied); host.occupant = null; }
+    if (host.occupant === target.occ) host.occupant = null;
     host.dest.vacate?.(host);
   }
 
@@ -944,7 +937,14 @@ function applyOne(node, byRef, liveTargets, applied) {
       placeChain(target, anchor, next);
       if (next.length) deliver(target, anchor);
     }
-    bindTarget(target, anchor, parent, incoming);
+    if (target.parent && target.parent !== parent) target.parent.children.delete(target);
+    target.anchor = anchor;
+    target.parent = parent;
+    parent?.children.add(target);
+    if (incoming) {
+      if (incoming.kind === 'instance') incoming.body = target;
+      setOccupant(anchor, incoming, null, null);
+    }
     if (!draft) return;
     target.committed = next;
     target.rev++;
