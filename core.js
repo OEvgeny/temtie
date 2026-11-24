@@ -216,26 +216,22 @@ function linkChild(parentDraft, childRef) {
 }
 
 function discardDraft(rootDraft) {
-  const dead = new Set([rootDraft]), refs = new Set([rootDraft.ref]), queue = [rootDraft];
-  for (let i = 0; i < queue.length; i++) {
-    const children = queue[i].children;
-    if (!children) continue;
-    for (const child of children) {
+  const dead = new Set([rootDraft]), refs = new Set([rootDraft.ref]);
+  for (const draft of dead) {
+    if (!draft.children) continue;
+    for (const child of draft.children) {
       refs.add(child);
-      if (child.draft && !dead.has(child.draft)) {
-        dead.add(child.draft);
-        queue.push(child.draft);
-      }
+      if (child.draft) dead.add(child.draft);
     }
   }
-  const keep = [];
+  const keep = new Set();
   for (const ref of refs)
-    if (ref.owners) for (const p of ref.owners) if (!dead.has(p)) { keep.push(ref); break; }
-  for (let i = 0; i < keep.length; i++) {
-    const d = keep[i].draft;
-    if (!d || d === rootDraft || !dead.has(d)) continue;
-    dead.delete(d);
-    if (d.children) for (const child of d.children) keep.push(child);
+    if (ref.owners) for (const parent of ref.owners) if (!dead.has(parent)) { keep.add(ref); break; }
+  // External owners retain reachable work, but not the explicitly discarded pass.
+  for (const ref of keep) {
+    const draft = ref.draft;
+    if (!draft || draft === rootDraft || !dead.delete(draft)) continue;
+    if (draft.children) for (const child of draft.children) keep.add(child);
   }
   for (const d of dead) {
     if (d.ref.draft === d) d.ref.draft = null;
@@ -431,12 +427,14 @@ function resolveSegment(target, draft, seg, values) {
   for (const binding of seg.bindings) {
     const raw = values[binding.slot];
     if (raw !== null && (typeof raw === 'object' || typeof raw === 'function')) {
-      if (raw[VALUE] !== undefined) {
-        setSlot(binding, resolveClaim(target, draft, binding, raw[VALUE], raw));
+      const spec = raw[VALUE];
+      if (spec !== undefined) {
+        setSlot(binding, resolveClaim(target, draft, binding, spec, raw));
         continue;
       }
-      if (raw[PRIVATE]) {
-        setSlot(binding, resolveBody(target, draft, binding, raw[PRIVATE]));
+      const child = raw[PRIVATE];
+      if (child) {
+        setSlot(binding, resolveBody(target, draft, binding, child));
         continue;
       }
     }
@@ -622,7 +620,7 @@ function planCommit(rootRef) {
     const rootNode = makeNode(rootRef, rootTarget.anchor, null);
     const byRef = new Map([[rootRef, rootNode]]);
     const queue = [rootNode];
-    const claimedTargets = new Set();
+    const reservedTargets = new Set(blocked);
 
     const attachRef = (ref, anchor, parentNode, entry) => {
       let childNode = byRef.get(ref);
@@ -643,7 +641,7 @@ function planCommit(rootRef) {
     for (let i = 0; i < queue.length; i++) {
       const node = queue[i], { ref, draft } = node;
       const owned = ownsTarget(ref) ? ref.target : null;
-      if (owned) claimedTargets.add(owned);
+      if (owned) reservedTargets.add(owned);
       const baseTarget = owned ?? seeded.get(ref);
       if (baseTarget?.children.size) {
         let keepMark = 0;
@@ -664,7 +662,7 @@ function planCommit(rootRef) {
       (queue[k].parentNode.children ??= []).push(queue[k]);
 
     // Pass 1B: top-down target resolution, tentative draft replay on mismatch, and ancestor cycle checks.
-    const wonTargets = new Set(), liveTargets = new Set(), ancestors = new Set();
+    const liveTargets = new Set(), ancestors = new Set();
     for (let t = rootTarget.parent; t; t = t.parent) ancestors.add(t);
     const steps = [], stack = [rootNode];
     while (stack.length) {
@@ -681,7 +679,7 @@ function planCommit(rootRef) {
       } else {
         const occ = anchor.occupant;
         const occBody = (occ?.spec ?? null) === ref.spec ? occ?.body : null;
-        const canWin = !!(occBody && !claimedTargets.has(occBody) && !wonTargets.has(occBody) && !blocked.has(occBody));
+        const canWin = occBody && !reservedTargets.has(occBody);
         if (canWin && occBody.children.size && (!node.draft || node.draft.mode === 'amend') && seeded.get(ref) !== occBody) {
           seeded.set(ref, occBody);
           continue plan;
@@ -693,7 +691,7 @@ function planCommit(rootRef) {
           seeded.delete(ref);
           continue plan;
         }
-        if (canWin) wonTargets.add(occBody);
+        if (canWin) reservedTargets.add(occBody);
         if (ref.target !== node.target || (node.draft && node.draft.baseRev !== node.target.rev))
           replayDraft(node, node.target, byRef);
       }
@@ -746,7 +744,8 @@ function evictSegs(segs, liveTargets, applied, errors = null) {
       noteLeaving(occ, applied);
       if (!occ.body) continue;
       if (liveTargets?.has(occ.body)) parkSegs(occ.body);
-      else if (occ.body.committed.length) segs.push(...occ.body.committed.splice(0));
+      else if (occ.body.committed.length)
+        for (const seg of occ.body.committed.splice(0)) segs.push(seg);
     }
   }
   for (let i = segs.length - 1; i >= 0; i--) {

@@ -105,8 +105,9 @@ Temtie gives you three explicit draft controls between renders and `commit()`:
   segments you emit before `commit()` still reuse existing nodes by call site
   and `#key`; anything you omit is removed on commit.
 - **`amend(target)`** updates only the segments you touch (and appends any new
-  ones) without dropping untouched segments. Useful for updating `n` keyed rows
-  in a large list in O(n) time:
+  ones) without dropping untouched segments. Useful for updating selected keyed
+  rows without re-emitting the whole list. Commit still checks the physical
+  placement of retained segments:
 
 ```js
 // Create one call site so amend() targets the same keyed segments
@@ -119,7 +120,7 @@ function renderAll(rows) {
   commit(list);
 }
 
-// Patch a single row without iterating the whole list
+// Record a single-row edit without re-emitting the whole list
 function updateRow(row) {
   amend(list);
   renderRow(row);
