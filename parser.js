@@ -6,7 +6,6 @@ export const TEMPLATE_HOLE_TYPES = {
   CHILD: 'child',
   ATTR: 'attr',
   SPREAD: 'spread',
-  META: 'meta',
 };
 
 // where the scan stands when a static ends. only TEXT and IN_TAG carry over

@@ -66,8 +66,7 @@ declare module 'temtie' {
   export type Hole =
     | { readonly type: 'child'; readonly slot: number }
     | { readonly type: 'attr'; readonly slot: number; readonly prop: PropertyKeyLike }
-    | { readonly type: 'spread'; readonly slot: number }
-    | { readonly type: 'meta'; readonly slot: number; readonly name: PropertyKeyLike };
+    | { readonly type: 'spread'; readonly slot: number };
 
   /* Core runtime */
   export type Renderable =
@@ -78,23 +77,14 @@ declare module 'temtie' {
     | undefined
     | object;
 
-  export interface HoleRange<B extends Builder<any, any> = Builder<any, any>> {
-    readonly start: BuilderNode<B>;
-    readonly end: BuilderNode<B>;
-    readonly builder: B;
-    clear(): void;
-  }
-
   export interface Handle<B extends Builder<any, any> = Builder<any, any>, Bs extends Builders = DefaultBuilders> {
-    readonly kind: 'child' | 'attr' | 'meta';
+    readonly kind: 'child' | 'attr';
     readonly builder: B;
     readonly node: BuilderNode<B> | null;
     readonly marker: BuilderNode<B> | null;
     readonly prop: PropertyKeyLike | null;
-    readonly name: PropertyKeyLike | null;
-    readonly target: Instance<Bs>;
+    readonly target: Instance<Bs> | null;
     set?(value: Renderable): void;
-    range?(): HoleRange<B> | null;
   }
 
   export type StageFn<V = any, Bs extends Builders = DefaultBuilders> = (
@@ -148,12 +138,11 @@ declare module 'temtie' {
     | { readonly kind: 'instance'; readonly body: DebugTarget | null; readonly spec: object | Function };
 
   export interface DebugBinding {
-    readonly dest: { readonly kind: 'root' | 'child' | 'attr' | 'meta' | 'spread' };
+    readonly dest: { readonly kind: 'root' | 'child' | 'attr' | 'spread' };
     readonly slot: number;
     readonly node?: unknown;
     readonly marker?: unknown;
     readonly prop?: PropertyKeyLike;
-    readonly name?: PropertyKeyLike;
     readonly occupant?: DebugOccupant | null;
   }
 
@@ -215,7 +204,6 @@ declare module 'temtie/core.js' {
     readonly CHILD: 'child';
     readonly ATTR: 'attr';
     readonly SPREAD: 'spread';
-    readonly META: 'meta';
   };
 }
 
@@ -230,7 +218,6 @@ declare module 'temtie/parser.js' {
     readonly CHILD: 'child';
     readonly ATTR: 'attr';
     readonly SPREAD: 'spread';
-    readonly META: 'meta';
   };
 }
 

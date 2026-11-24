@@ -56,9 +56,9 @@ Three rules explain almost everything in Temtie:
    It does not mutate the DOM or trigger side effects, so you can abandon
    a half-written pass with `discard()`, leaving the live DOM untouched.
 3. **`commit(capture)` settles in three phases:**
-   - **Plan**: expands any value contracts, resolves capture moves, and checks
-     for cycles without touching the DOM. If anything throws here,
-     nothing on screen changes.
+   - **Plan**: resolves capture ownership and moves, and checks for cycles
+     without touching the DOM. If anything throws here, nothing on screen
+     changes.
    - **Apply**: removes dropped segments, moves reordered segments minimally
      (using longest increasing subsequence), and writes changed slots.
    - **Effects**: runs `release()` on departing contracts first, then runs
@@ -189,18 +189,16 @@ and pass fresh, immutable payload objects when values change. All contract
 callbacks are synchronous, and `prev` is the retained previous payload value,
 not a deep snapshot:
 
-- **`stage(target, prev, next)`** runs in the **Plan** phase (DOM-free). Use it
-  to stage child templates into `target` or skip work when `prev` matches
-  `next`. `prev` is `undefined` on first mount and only advances once the
-  target's writes and descendants finish applying. Failed Plan work is
-  abandoned before touching the DOM; Apply and Effects do not provide general
-  rollback.
+- **`stage(target, prev, next)`** runs synchronously when the template is
+  staged (DOM-free). Use it to stage child templates into `target`, expose
+  `target` to caller code, or skip work when `prev` matches `next`. `prev` is
+  `undefined` on first mount and only advances once the target's writes and
+  descendants finish applying. Discarded drafts abandon staged work without
+  running `commit()` or `release()`.
 - **`commit(handle, prev, next)`** runs in the **Effects** phase (post-order,
   after the DOM is updated and departing claims have released). `handle` gives
-  you `{ kind, builder, node, marker, prop, name, target }` plus `handle.set()`
-  (for writable slots) and `handle.range()` (for managing multi-node ranges in
-  child slots). `handle.target` is lazy — hole-only contracts allocate no child
-  target unless you touch it.
+  you `{ kind, builder, node, marker, prop, target }` — with `handle.target`
+  non-null when the descriptor has `stage`, or `handle.set()` when it does not.
 - **`release(handle, current)`** runs when the claim leaves the hole or its
   segment is dropped, before any arriving `commit()` runs.
 
@@ -242,11 +240,11 @@ render(1);
 ```
 
 A few guardrails built into contracts:
-- A contract cannot both stage templates into `target` and write directly
-  through `handle.set()` / `handle.range()`.
-- `commit()` and handle writes are rejected while a commit is in Plan/Apply.
-- Same-claim reentry (a `commit()` synchronously triggering another `commit()`
-  that updates or removes itself) is rejected in Plan. -->
+- A contract with `stage` renders into `handle.target` (no `handle.set()`); a
+  contract without `stage` writes through `handle.set()` (`handle.target` is
+  `null`).
+- `commit()` is rejected while staging, applying, or running effects.
+- Staging into a target while its own template is mid-stage is rejected. -->
 
 ## Builders: DOM, SVG, And Markup
 
@@ -337,7 +335,7 @@ Set `debug.stacks = true` to include captured call stacks on `stage` and
   and appends new ones without dropping untouched segments.
 - **`discard(target)`** — cancels the uncommitted draft on `target`, keeping the
   committed output intact.
-- **`TEMPLATE_HOLE_TYPES`** — `{ CHILD, ATTR, SPREAD, META }` constants for
+- **`TEMPLATE_HOLE_TYPES`** — `{ CHILD, ATTR, SPREAD }` constants for
   custom template compilers/builders.
 
 ## License
