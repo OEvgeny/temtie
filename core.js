@@ -300,7 +300,7 @@ function makeSegment(site, keyOrIndex, keyed) {
     return {
       dest, seg, slot: hole.slot, builder,
       marker: dest.kind === HOLE.CHILD ? nodes[index] : null,
-      end: null,
+      end: null, dirty: false,
       node: dest.kind === HOLE.CHILD ? null : nodes[index],
       prop: hole.prop, name: hole.name ?? null,
       container: null, occupant: null,
@@ -560,7 +560,7 @@ function noteLeaving(occ, applied) {
 function isLiveBody(body, stop = null) {
   for (let cur = body; cur; cur = cur.parent) {
     if (!cur.anchor || cur.anchor.occupant?.body !== cur) return false;
-    if (cur === stop || (!stop && cur.anchor.dest.kind === ROOT)) return true;
+    if (cur === stop || cur.anchor.dest.kind === ROOT) return true;
   }
   return false;
 }
@@ -621,7 +621,7 @@ const checkReentry = (bad) => {
 
 function assertNoReentry(nodes) {
   for (const claim of ACTIVE_CLAIMS) {
-    const bodyNode = claim.body && nodes.get(claim.body);
+    const body = claim.body ?? claim.ref?.target, bodyNode = body && nodes.get(body);
     checkReentry(bodyNode && bodyNode.anchor !== claim.binding);
     const ownerNode = nodes.get(claim.owner);
     if (ownerNode) {
@@ -638,7 +638,7 @@ function assertNoReentry(nodes) {
 function claimFor(target, binding, spec, raw) {
   const cur = binding.occupant;
   const claim = cur?.kind === 'instance' && cur.spec === spec && cur.alive ? cur : {
-    kind: 'instance', spec, staged: UNSET, committed: UNSET, next: raw,
+    kind: 'instance', spec, staged: UNSET, committed: UNSET, next: raw, seq: 0,
     ref: null, body: null, alive: true, usedHole: false, handle: null,
     binding: null, owner: target,
   };
@@ -841,9 +841,10 @@ function recoverApply(queue, liveNodes, errors, rootTarget, applied) {
 }
 
 function runCommits(commits, errors) {
-  for (const { claim, next, isNew } of commits) {
-    if (!claim.alive) continue;
-    const prev = claim.committed === UNSET ? undefined : claim.committed;
+  for (const { claim, next, seq } of commits) {
+    if (!claim.alive || claim.seq !== seq) continue;
+    const isNew = claim.committed === UNSET;
+    const prev = isNew ? undefined : claim.committed;
     let ok = false;
     ACTIVE_CLAIMS.add(claim);
     try {
@@ -857,8 +858,13 @@ function runCommits(commits, errors) {
     }
     if (ok || !isNew || claim.binding.occupant !== claim) continue;
     const binding = claim.binding;
-    if (binding.end) tryStep(errors, () => clearRange(binding));
-    if (claim.usedHole) tryStep(errors, () => binding.dest.clear?.(binding));
+    if (claim.usedHole) binding.dirty = true;
+    if (binding.end || binding.dirty) {
+      const before = errors.length;
+      tryStep(errors, () => clearHole(binding));
+      if (errors.length > before)
+        queuePending(liveOwner(claim.owner, claim.owner.parent, claim.owner), binding);
+    }
     binding.occupant = null;
     claim.committed = next;
     const body = claim.body ?? claim.ref?.target;
@@ -954,17 +960,28 @@ function parkMoving(initial, liveNodes) {
   }
 }
 
-function queuePending(owner, seg) {
+function queuePending(owner, item) {
   const list = owner.pending ??= [];
-  if (!list.includes(seg)) list.push(seg);
+  if (!list.includes(item)) list.push(item);
 }
 
-function finishEvict(seg) {
-  if (seg.retired) return;
-  for (const binding of seg.bindings) if (binding.end) clearRange(binding);
-  if (!seg.parked) removeSeg(seg);
-  seg.parked = null;
-  seg.retired = true;
+function clearHole(binding) {
+  if (binding.end) clearRange(binding);
+  if (binding.dirty) {
+    binding.dest.clear?.(binding);
+    binding.dirty = false;
+  }
+}
+
+const isRetired = (item) => (item.bindings ? item.retired : !item.end && !item.dirty);
+
+function finishPending(item) {
+  if (!item.bindings) { clearHole(item); return; }
+  if (item.retired) return;
+  for (const binding of item.bindings) clearHole(binding);
+  if (!item.parked) removeSeg(item);
+  item.parked = null;
+  item.retired = true;
 }
 
 function drainPending(target, applied) {
@@ -972,7 +989,7 @@ function drainPending(target, applied) {
   if (!pending) return;
   let i = 0;
   try {
-    for (; i < pending.length; i++) finishEvict(pending[i]);
+    for (; i < pending.length; i++) finishPending(pending[i]);
   } finally {
     if (i < pending.length) {
       (applied.tried ??= new Set()).add(pending[i]);
@@ -985,41 +1002,43 @@ function drainPending(target, applied) {
 
 function evictSegs(initial, owner, liveNodes, applied, errors) {
   if (!initial.length) return;
-  const segs = initial.slice();
-  for (let i = 0; i < segs.length; i++) {
-    for (const binding of segs[i].bindings) {
+  const items = initial.slice();
+  for (let i = 0; i < items.length; i++) {
+    const bindings = items[i].bindings;
+    if (!bindings) continue;
+    for (const binding of bindings) {
       const occ = binding.occupant;
       if (!occ) continue;
       binding.occupant = null;
       noteLeaving(occ, applied);
       if (!occ.body || liveNodes?.has(occ.body)) continue;
-      if (liveNodes) pushAll(segs, occ.body.committed);
+      if (liveNodes) pushAll(items, occ.body.committed);
     }
   }
-  let i = segs.length - 1;
+  let i = items.length - 1;
   try {
     for (; i >= 0; i--) {
-      const seg = segs[i];
-      if (seg.retired) continue;
-      if (applied.tried?.has(seg)) {
-        if (owner) queuePending(owner, seg);
+      const item = items[i];
+      if (isRetired(item)) continue;
+      if (applied.tried?.has(item)) {
+        if (owner) queuePending(owner, item);
         continue;
       }
       if (errors) {
         const before = errors.length;
-        tryStep(errors, () => finishEvict(seg));
+        tryStep(errors, () => finishPending(item));
         if (errors.length > before) {
-          (applied.tried ??= new Set()).add(seg);
-          if (owner) queuePending(owner, seg);
+          (applied.tried ??= new Set()).add(item);
+          if (owner) queuePending(owner, item);
         }
       } else {
-        finishEvict(seg);
+        finishPending(item);
       }
     }
   } finally {
     if (i >= 0) {
-      (applied.tried ??= new Set()).add(segs[i]);
-      if (owner) for (let j = i; j >= 0; j--) if (!segs[j].retired) queuePending(owner, segs[j]);
+      (applied.tried ??= new Set()).add(items[i]);
+      if (owner) for (let j = i; j >= 0; j--) if (!isRetired(items[j])) queuePending(owner, items[j]);
     }
   }
 }
@@ -1102,8 +1121,16 @@ function vacateBinding(binding, occ, nextKind, owner, liveNodes, applied) {
   binding.occupant = null;
   noteLeaving(occ, applied);
   if (occ.kind === 'instance') {
-    if (binding.end) clearRange(binding);
-    if (occ.usedHole && nextKind !== 'plain') binding.dest.clear?.(binding);
+    if (occ.usedHole && nextKind !== 'plain') binding.dirty = true;
+    if (binding.end || binding.dirty) {
+      try {
+        clearHole(binding);
+      } catch (error) {
+        (applied.tried ??= new Set()).add(binding);
+        if (owner) queuePending(owner, binding);
+        throw error;
+      }
+    }
   }
   if (occ.body && !liveNodes?.has(occ.body)) evictSegs(occ.body.committed, owner, liveNodes, applied, null);
 }
@@ -1191,7 +1218,7 @@ function applyEdits(target, edits, liveNodes, applied) {
 
 function publishClaims(target, claims, liveNodes, applied) {
   for (const [binding, claim] of claims) {
-    const cur = binding.occupant, isNew = claim.binding === null;
+    const cur = binding.occupant;
     if (cur !== claim) {
       if (cur) vacateBinding(binding, cur, 'instance', target, liveNodes, applied);
       binding.occupant = claim;
@@ -1199,7 +1226,7 @@ function publishClaims(target, claims, liveNodes, applied) {
       debug.enabled && debug.emit({ type: 'claim', binding, occupant: claim });
     }
     claim.staged = claim.next;
-    if (commitOf(claim.spec)) applied.commits.push({ claim, next: claim.next, isNew });
+    if (commitOf(claim.spec)) applied.commits.push({ claim, next: claim.next, seq: claim.seq = ++PASS });
   }
 }
 
@@ -1246,16 +1273,15 @@ function applyPlan(rootNode, liveNodes, applied) {
     const item = stack.pop();
     if (item.post) {
       // Post-order: body writes and all descendants succeeded — advance staged checkpoint & enqueue commit
-      const { claim, isNew } = item;
+      const { claim } = item;
       claim.staged = claim.next;
-      if (commitOf(claim.spec)) applied.commits.push({ claim, next: claim.next, isNew });
+      if (commitOf(claim.spec)) applied.commits.push({ claim, next: claim.next, seq: claim.seq = ++PASS });
       continue;
     }
     const incomingOcc = item.incomingOcc;
-    const incomingIsNew = incomingOcc?.kind === 'instance' && incomingOcc.binding === null;
     applyOne(item, liveNodes, applied);
     if (incomingOcc?.kind === 'instance')
-      stack.push({ post: true, claim: incomingOcc, isNew: incomingIsNew });
+      stack.push({ post: true, claim: incomingOcc });
     const children = item.children;
     if (children) for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
   }
