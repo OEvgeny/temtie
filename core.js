@@ -162,8 +162,8 @@ function makeProto(builders) {
   return proto;
 }
 
-function makeRef(target) {
-  const ref = { inst: Object.create(target ? target.proto : null), target, draft: null, owners: null, spec: null };
+function makeRef(target, spec = null) {
+  const ref = { inst: Object.create(target ? target.proto : null), target, draft: null, owners: null, spec };
   Object.defineProperty(ref.inst, PRIVATE, { value: ref });
   return ref;
 }
@@ -190,7 +190,7 @@ function setTarget(ref, target) {
 
 function detachRef(ref) {
   if (!ref.target || isOwnedAnchored(ref)) return;
-  if (ref.target.owner === ref) ref.target.owner = null;
+  if (ownsTarget(ref)) ref.target.owner = null;
   setTarget(ref, null);
 }
 
@@ -290,15 +290,15 @@ function compile(builder, strings, target, pass) {
 function pickSegment(target, draft, site, keyed, key) {
   let cursor = draft.used?.get(site);
   if (!cursor) (draft.used ??= new Map()).set(site, cursor = { index: 0, keys: null });
-  const bucket = target.buckets.get(site), keyOrIndex = keyed ? key : cursor.index++;
   if (keyed) {
     const keys = cursor.keys ??= new Set();
     if (keys.has(key)) throw new Error('temtie/core: duplicate key in one pass');
     keys.add(key);
   }
-  let seg = keyed ? bucket?.byKey.get(key) : bucket?.byIndex[keyOrIndex];
+  const slotKey = keyed ? key : cursor.index++;
+  let seg = target.buckets.get(site)?.[+keyed].get(slotKey);
   if (!seg) {
-    seg = makeSegment(site, keyOrIndex, keyed);
+    seg = makeSegment(site, keyed, slotKey);
     (draft.created ??= []).push(seg);
   }
   return seg;
@@ -321,13 +321,11 @@ function makeChannel(builder) {
     const target = ref.target;
     if (!target) throw new Error('temtie/core: cannot stage into a detached capture');
     const draft = ref.draft ?? beginDraft(ref, 'replace', 'render');
-    const site = compile(builder, strings, target, draft.pass);
-    const template = site.template,
+    const site = compile(builder, strings, target, draft.pass),
+      template = site.template,
       key = template.keySlot >= 0 ? values[template.keySlot] : undefined,
-      keyed = carriesIdentity(key),
-      createdBefore = draft.created?.length ?? 0,
-      seg = pickSegment(target, draft, site, keyed, key),
-      fresh = (draft.created?.length ?? 0) > createdBefore;
+      seg = pickSegment(target, draft, site, carriesIdentity(key), key),
+      fresh = draft.created?.at(-1) === seg;
 
     const ev = debug.enabled && debug.emit({
       type: 'stage', target, pass: draft.pass, segment: seg, template, fresh,
@@ -338,7 +336,7 @@ function makeChannel(builder) {
 
     STAGING.add(ref);
     try {
-      withCause(ev, () => resolveSegment(ref, draft, seg, values));
+      withCause(ev, () => resolveSegment(target, draft, seg, values));
     } finally {
       STAGING.delete(ref);
     }
@@ -346,14 +344,12 @@ function makeChannel(builder) {
   };
 }
 
-function makeSegment(site, keyOrIndex, keyed) {
+function makeSegment(site, keyed, key) {
   const template = site.template,
     builder = template.builder,
     { content, start, end, nodes } = template.instantiate(),
     seg = {
-      site, template, builder, keyed,
-      key: keyed ? keyOrIndex : undefined,
-      index: keyed ? -1 : keyOrIndex,
+      site, template, builder, keyed, key,
       start, end, bindings: null, parked: content,
       keepPass: 0, oldIndex: -1,
     };
@@ -426,27 +422,22 @@ const DEST = {
   [HOLE.SPREAD]: {
     kind: HOLE.SPREAD,
     write: (binding, value) => writeSpread(binding, value == null ? {} : Object(value)),
-    clear: (binding) => writeSpread(binding, {}),
   },
 };
 
-function resolveSegment(ref, draft, seg, values) {
-  const target = ref.target;
+function resolveSegment(target, draft, seg, values) {
   let edits = draft.edits;
   const setSlot = (binding, entry) => (edits ??= draft.edits = new Map()).set(binding, entry);
 
   for (const binding of seg.bindings) {
     const raw = values[binding.slot];
     if (raw !== null && (typeof raw === 'object' || typeof raw === 'function')) {
-      const spec = raw[VALUE];
-      if (spec !== undefined) {
-        setSlot(binding, resolveClaim(target, draft, binding, spec, raw));
+      if (raw[VALUE] !== undefined) {
+        setSlot(binding, resolveClaim(target, draft, binding, raw[VALUE], raw));
         continue;
       }
-      const childRef = raw[PRIVATE];
-      if (childRef) {
-        resolveBody(target, draft, binding, childRef);
-        setSlot(binding, { [STAGED]: true, ref: childRef });
+      if (raw[PRIVATE]) {
+        setSlot(binding, resolveBody(target, draft, binding, raw[PRIVATE]));
         continue;
       }
     }
@@ -471,6 +462,7 @@ function resolveBody(parentTarget, draft, binding, childRef) {
     setTarget(childRef, occ?.kind === 'body' ? occ.body : makeTarget(parentTarget.proto, childRef));
   }
   linkChild(draft, childRef);
+  return { [STAGED]: true, ref: childRef };
 }
 
 function resolveClaim(parentTarget, draft, binding, spec, raw) {
@@ -487,8 +479,8 @@ function resolveClaim(parentTarget, draft, binding, spec, raw) {
   let claim = cur;
   if (!reused) {
     const body = stageFn && ((draft.tentative && sameSpec && cur.body) || makeTarget(parentTarget.proto));
-    claim = Object.assign(body ? makeRef(body) : { inst: null }, {
-      kind: 'instance', spec, staged: UNSET, committed: UNSET,
+    claim = Object.assign(body ? makeRef(body, spec) : { inst: null, spec }, {
+      kind: 'instance', staged: UNSET, committed: UNSET,
       body: null, alive: true, usedHole: false, handle: null, binding: null,
     });
     if (body && !body.owner) body.owner = claim;
@@ -558,9 +550,7 @@ function withCause(ev, run) {
 
 const nextListOf = (draft, committed) => (draft.mode === 'amend'
   ? (draft.created ? committed.concat(draft.created) : committed)
-  : (draft.list ?? (draft.base === committed && draft.matched === committed.length
-    ? committed
-    : draft.base.slice(0, draft.matched))));
+  : (draft.list ?? (draft.matched === committed.length ? committed : committed.slice(0, draft.matched))));
 
 function noteLeaving(occ, applied) {
   if (occ.body) applied.leaving.push(occ.body);
@@ -618,12 +608,12 @@ function replayDraft(node, target, byRef) {
 
 // Pass 1 (DOM-free, non-mutating on existing state): resolve winners, tentative replays, and cycles.
 function planCommit(rootRef) {
-  const rootTarget = rootRef.target;
-  if (!rootTarget?.anchor || rootTarget.owner !== rootRef)
+  if (!isOwnedAnchored(rootRef))
     throw new Error('temtie/core: cannot commit an unanchored capture');
+  const rootTarget = rootRef.target;
 
   const makeNode = (ref, anchor, parentNode, entry = null) => ({
-    ref, target: null, anchor, parentNode, entry, draft: null, children: null,
+    ref, target: null, anchor, parentNode, entry, draft: ref.draft, children: null,
   });
 
   const seeded = new Map(); // tentative ref → won target whose surviving children must join Pass 1A
@@ -653,11 +643,10 @@ function planCommit(rootRef) {
     };
 
     for (let i = 0; i < queue.length; i++) {
-      const node = queue[i], ref = node.ref, draft = ref.draft;
-      node.draft = draft;
-      const owned = ref.target && ref.target.owner === ref ? ref.target : null;
+      const node = queue[i], { ref, draft } = node;
+      const owned = ownsTarget(ref) ? ref.target : null;
       if (owned) claimedTargets.add(owned);
-      const baseTarget = owned ?? seeded.get(ref) ?? null;
+      const baseTarget = owned ?? seeded.get(ref);
       if (baseTarget?.children.size) {
         let keepMark = 0;
         if (draft && draft.mode !== 'amend') {
@@ -666,7 +655,7 @@ function planCommit(rootRef) {
         }
         for (const child of baseTarget.children) {
           if (!draft || ((draft.mode === 'amend' || child.anchor.seg.keepPass === keepMark) && !draft.edits?.has(child.anchor)))
-            if (child.owner) attachRef(child.owner, child.anchor, node);
+            attachRef(child.owner, child.anchor, node);
         }
       }
       if (draft?.edits) for (const [binding, entry] of draft.edits)
@@ -677,32 +666,29 @@ function planCommit(rootRef) {
       (queue[k].parentNode.children ??= []).push(queue[k]);
 
     // Pass 1B: top-down target resolution, tentative draft replay on mismatch, and ancestor cycle checks.
-    const wonTargets = new Set();
-    const liveTargets = new Set();
-    const ancestors = new Set();
+    const wonTargets = new Set(), liveTargets = new Set(), ancestors = new Set();
     for (let t = rootTarget.parent; t; t = t.parent) ancestors.add(t);
-    const steps = [], resolveStack = [rootNode];
-    while (resolveStack.length) {
-      const node = resolveStack.pop();
+    const steps = [], stack = [rootNode];
+    while (stack.length) {
+      const node = stack.pop();
       if (node.leave) {
         ancestors.delete(node.leave.target);
         if (node.leave.entry?.claim) steps.push(node.leave.entry);
         continue;
       }
-      const ref = node.ref, anchor = node.anchor, parentTarget = node.parentNode?.target ?? rootTarget.parent;
+      const { ref, anchor } = node;
 
-      if (ref.target && ref.target.owner === ref) {
+      if (ownsTarget(ref)) {
         node.target = ref.target;
       } else {
         const occ = anchor.occupant;
-        const occBody = ref.spec
-          ? (occ?.kind === 'instance' && occ.spec === ref.spec ? occ.body : null)
-          : (occ?.kind === 'body' ? occ.body : null);
+        const occBody = (occ?.spec ?? null) === ref.spec ? occ?.body : null;
         const canWin = !!(occBody && !claimedTargets.has(occBody) && !wonTargets.has(occBody) && !blocked.has(occBody));
         if (canWin && occBody.children.size && (!node.draft || node.draft.mode === 'amend') && seeded.get(ref) !== occBody) {
           seeded.set(ref, occBody);
           continue plan;
         }
+        const parentTarget = node.parentNode?.target ?? rootTarget.parent;
         node.target = canWin ? occBody : makeTarget(parentTarget.proto);
         if (seeded.has(ref) && node.target !== seeded.get(ref)) {
           blocked.add(seeded.get(ref));
@@ -720,8 +706,8 @@ function planCommit(rootRef) {
       steps.push(node);
       if (node.children || node.entry?.claim) {
         ancestors.add(node.target);
-        resolveStack.push({ leave: node });
-        if (node.children) for (let i = node.children.length - 1; i >= 0; i--) resolveStack.push(node.children[i]);
+        stack.push({ leave: node });
+        if (node.children) for (let i = node.children.length - 1; i >= 0; i--) stack.push(node.children[i]);
       }
     }
     return { steps, byRef, liveTargets };
@@ -873,9 +859,8 @@ function reconcileSegments(target, anchor, draft, liveTargets, applied) {
 function indexCreated(target, created) {
   for (const seg of created) {
     let bucket = target.buckets.get(seg.site);
-    if (!bucket) target.buckets.set(seg.site, bucket = { byIndex: [], byKey: new Map() });
-    if (seg.keyed) bucket.byKey.set(seg.key, seg);
-    else bucket.byIndex[seg.index] = seg;
+    if (!bucket) target.buckets.set(seg.site, bucket = [new Map(), new Map()]);
+    bucket[+seg.keyed].set(seg.key, seg);
   }
 }
 
@@ -955,12 +940,9 @@ function applyOne(node, byRef, liveTargets, applied) {
 }
 
 function pruneSeg(target, seg) {
-  const bucket = target.buckets.get(seg.site);
-  if (!bucket) return;
-  if (seg.keyed) { if (bucket.byKey.get(seg.key) === seg) bucket.byKey.delete(seg.key); }
-  else if (bucket.byIndex[seg.index] === seg) {
-    bucket.byIndex[seg.index] = undefined;
-    while (bucket.byIndex.length && !bucket.byIndex[bucket.byIndex.length - 1]) bucket.byIndex.pop();
+  const bucket = target.buckets.get(seg.site), map = bucket?.[+seg.keyed];
+  if (map?.get(seg.key) === seg) {
+    map.delete(seg.key);
+    if (!bucket[0].size && !bucket[1].size) target.buckets.delete(seg.site);
   }
-  if (!bucket.byKey.size && !bucket.byIndex.length) target.buckets.delete(seg.site);
 }
