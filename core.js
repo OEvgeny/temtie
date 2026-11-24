@@ -744,10 +744,11 @@ function planCommit(rootTarget, rootAnchor, rootParent, planPass) {
         const st = ref.target;
         if (!st) continue;
         expandedTargets.add(st);
-        const stNode = nodes.get(st), d = stNode?.draft ?? st.staged;
-        if (stNode?.draft) { dropDraft(stNode.draft); stNode.draft = null; }
-        if (st.staged) clearStaged(st);
-        drops.push([st, d, Infinity]);
+        const stNode = nodes.get(st), d1 = stNode?.draft ?? null, d2 = st.staged;
+        if (d1) { dropDraft(d1); stNode.draft = null; }
+        if (d2) clearStaged(st);
+        drops.push([st, d1 ?? d2, Infinity]);
+        if (d1 && d2) drops.push([st, d2, Infinity]);
       }
       const kept = new Set(), saved = new Map();
       for (let j = 0; j < queue.length; j++) {
@@ -788,24 +789,43 @@ function planCommit(rootTarget, rootAnchor, rootParent, planPass) {
   }
 }
 
-function recoverApply(queue, errors, rootTarget, applied) {
+function recoverApply(queue, liveNodes, errors, rootTarget, applied) {
   for (const node of queue) if (node.draft) dropDraft(node.draft);
-  for (const node of queue) {
-    const t = node.target;
-    if (!node.placed && node.incomingOcc?.kind === 'body'
-      && t.anchor && t.anchor.occupant?.body !== t && node.ownerNode?.placed) {
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const node of queue) {
+      const t = node.target;
+      if (node.placed || node.incomingOcc?.kind !== 'body'
+        || !t.anchor || isLiveBody(t) || !node.ownerNode?.placed) continue;
       const occ = node.anchor.occupant;
-      if (occ?.kind === 'plain') {
+      if (occ && !sameOccupant(occ, node.incomingOcc)) {
         const before = errors.length;
-        tryStep(errors, () => vacateBinding(node.anchor, occ, 'body', node.parent, null, applied));
+        tryStep(errors, () => vacateBinding(node.anchor, occ, 'body', node.parent, liveNodes, applied));
         if (errors.length === before) node.anchor.occupant = null;
       }
       if (!node.anchor.occupant) {
         t.dirty = true;
         bindTarget(t, node.anchor, node.parent, node.incomingOcc);
+        changed = true;
       }
     }
-    if (node.placed || !node.draft) continue;
+  }
+  for (const node of queue) {
+    const t = node.target;
+    if (node.placed) continue;
+    if (node.incomingOcc?.kind === 'body' && t.anchor === node.anchor && t.dirty && t.committed.length) {
+      let prevEnd = null;
+      for (const seg of t.committed) {
+        if (!seg.parked && !seg.retired) {
+          if (inPlace(t.anchor, seg, prevEnd)) { prevEnd = seg.end; continue; }
+          tryStep(errors, () => {
+            if (seg.builder.parent(seg.start)) seg.parked = seg.builder.extract(seg.start, seg.end);
+          });
+        }
+        prevEnd = null;
+      }
+    }
+    if (!node.draft) continue;
     if (node.draft.created) {
       const owner = liveOwner(t, node.parent, rootTarget);
       for (const seg of node.draft.created)
@@ -872,7 +892,7 @@ function commitTarget(rootTarget) {
     } catch (error) {
       if (!plan) throw error;
       errors.push(error);
-      recoverApply(plan.queue, errors, rootTarget, applied);
+      recoverApply(plan.queue, plan.nodes, errors, rootTarget, applied);
     } finally {
       PLAN_NODES = PLAN_ROOT = null;
       if (plan) releases = disposeBodies(applied.leaving, applied.ended, errors, rootTarget, applied.tried, planPass);
@@ -1052,8 +1072,8 @@ function bindTarget(target, anchor, parent, incomingOcc) {
 }
 
 function placeOne(target, anchor, parent, incomingOcc) {
-  const move = needsPlace(target, anchor);
-  if (incomingOcc?.kind !== 'instance') {
+  const move = needsPlace(target, anchor), preBind = !!target.anchor && incomingOcc?.kind !== 'instance';
+  if (preBind) {
     if (move) target.dirty = true;
     bindTarget(target, anchor, parent, incomingOcc);
   }
@@ -1063,7 +1083,7 @@ function placeOne(target, anchor, parent, incomingOcc) {
       if (target.committed.length) deliver(target, anchor);
     });
   }
-  if (incomingOcc?.kind === 'instance') bindTarget(target, anchor, parent, incomingOcc);
+  if (!preBind) bindTarget(target, anchor, parent, incomingOcc);
 }
 
 function vacateBinding(binding, occ, nextKind, owner, liveNodes, applied) {
@@ -1204,12 +1224,13 @@ function applyOne(node, liveNodes, applied) {
   }
 
   settleSpan(target, 'flush', draft.pass, () => {
-    if (incomingOcc?.kind !== 'instance') {
+    const preBind = !!target.anchor && incomingOcc?.kind !== 'instance';
+    if (preBind) {
       if (target.anchor !== anchor) target.dirty = true;
       bindTarget(target, anchor, parent, incomingOcc);
     }
     const nextList = reconcileSegments(target, anchor, draft, liveNodes, applied);
-    if (incomingOcc?.kind === 'instance') bindTarget(target, anchor, parent, incomingOcc);
+    if (!preBind) bindTarget(target, anchor, parent, incomingOcc);
     target.committed = nextList;
     node.placed = true;
     if (draft.created) indexCreated(target, draft.created);
