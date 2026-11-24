@@ -106,8 +106,9 @@ Temtie gives you three explicit draft controls between renders and `commit()`:
   and `#key`; anything you omit is removed on commit.
 - **`amend(target)`** updates only the segments you touch (and appends any new
   ones) without dropping untouched segments. Useful for updating selected keyed
-  rows without re-emitting the whole list. Commit still checks the physical
-  placement of retained segments:
+  rows without re-emitting the whole list. An unchanged, clean segment chain
+  needs only a boundary check during commit; changed lists, moved captures, or
+  uncertain placement require full verification:
 
 ```js
 // Create one call site so amend() targets the same keyed segments
@@ -251,6 +252,10 @@ A few guardrails built into contracts:
 
 Temtie never touches browser globals directly — all node creation, movement, and
 property writes go through a builder (`import type { Builder } from 'temtie'`).
+Keep Temtie-owned node order under its control: the placement cache tracks
+Temtie's structural operations, not arbitrary external DOM reordering.
+Property-fragment receivers remain subject to full checks because they may
+adopt nodes later.
 
 ### DOM & SVG
 

@@ -170,7 +170,7 @@ function makeRef(target, spec = null) {
 function makeTarget(proto, owner = null) {
   const target = {
     proto, owner, occ: null, anchor: null, parent: null, children: new Set(),
-    committed: [], buckets: new Map(), rev: 0,
+    committed: [], buckets: new Map(), rev: 0, dirty: false,
   };
   target.occ = { kind: 'body', body: target };
   return target;
@@ -722,12 +722,15 @@ function needsPlace(target, anchor) {
   let prevEnd = null;
   for (const seg of target.committed) {
     if (seg.parked || !inPlace(anchor, seg, prevEnd)) return true;
+    if (!target.dirty) return false; // The rest of the chain was already checked.
     prevEnd = seg.end;
   }
+  target.dirty = !!anchor.dest.deliver; // Receivers can consume nodes after this check.
   return false;
 }
 
 function parkSegs(target) {
+  target.dirty = true;
   for (let i = target.committed.length - 1; i >= 0; i--) {
     const seg = target.committed[i];
     if (!seg.parked && seg.builder.parent(seg.start))
@@ -759,6 +762,7 @@ function evictSegs(segs, liveTargets, applied, errors = null) {
 }
 
 function placeChain(target, anchor, list) {
+  target.dirty = true;
   let prevEnd = null;
   for (const seg of list) {
     if (seg.parked || !inPlace(anchor, seg, prevEnd)) {
@@ -777,10 +781,12 @@ function placeChain(target, anchor, list) {
     }
     prevEnd = seg.end;
   }
+  target.dirty = false;
 }
 
 function deliver(target, anchor) {
   if (!anchor.dest.deliver) return;
+  target.dirty = true; // The receiver may consume some or all of the fragment.
   debug.enabled && debug.emit({ type: 'deliver', target, binding: anchor });
   anchor.dest.deliver(anchor);
 }
@@ -821,6 +827,7 @@ function enqueueCommit(claim, next, applied) {
 function reconcileSegments(target, anchor, draft, liveTargets, applied) {
   const committed = target.committed, nextList = nextListOf(draft, committed);
   if (nextList === committed || draft.mode === 'amend') return nextList;
+  target.dirty = true;
   const mark = ++PASS;
   for (const seg of nextList) seg.keepPass = mark;
   let order = 0;
@@ -892,13 +899,13 @@ function applyOne(node, byRef, liveTargets, applied) {
     host.dest.vacate?.(host);
   }
 
-  const moving = !draft && needsPlace(target, anchor);
+  const moving = needsPlace(target, anchor);
   const ev = debug.enabled && (draft || moving) && debug.emit({
     type: draft ? 'flush' : 'place', target, pass: draft?.pass ?? 0,
   });
   withCause(ev, () => {
     const next = draft ? reconcileSegments(target, anchor, draft, liveTargets, applied) : target.committed;
-    if (draft || moving) placeChain(target, anchor, next);
+    if (next !== target.committed || moving) placeChain(target, anchor, next);
     if (target.parent && target.parent !== parent) target.parent.children.delete(target);
     target.anchor = anchor;
     target.parent = parent;
