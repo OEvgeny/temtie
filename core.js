@@ -512,22 +512,21 @@ function handleOf(claim) {
 }
 
 function markKeepSet(nextList) {
-  const seq = [], segs = [];
-  let prevIdx = -1, ordered = true;
-  for (let i = 0; i < nextList.length; i++) {
-    const seg = nextList[i];
+  let prevIdx = -1, segs = null;
+  for (const seg of nextList) {
     if (seg.parked) continue;
-    if (seg.oldIndex < prevIdx) ordered = false;
+    if (seg.oldIndex < prevIdx) { segs = nextList.filter(s => !s.parked); break; }
     prevIdx = seg.oldIndex;
-    seq.push(seg.oldIndex);
-    segs.push(seg);
   }
-  if (ordered) return 0;
-  const n = seq.length, mark = ++PASS, tails = [], prev = new Int32Array(n);
+  if (!segs) return 0;
+  const n = segs.length, mark = ++PASS, tails = [], prev = new Int32Array(n);
   for (let i = 0; i < n; i++) {
-    const val = seq[i];
     let lo = 0, hi = tails.length;
-    while (lo < hi) { const mid = (lo + hi) >> 1; if (seq[tails[mid]] < val) lo = mid + 1; else hi = mid; }
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (segs[tails[mid]].oldIndex < segs[i].oldIndex) lo = mid + 1;
+      else hi = mid;
+    }
     prev[i] = lo > 0 ? tails[lo - 1] : -1;
     tails[lo] = i;
   }
@@ -575,7 +574,7 @@ function disposeBodies(applied, errors) {
     if (disposed.has(body) || isLiveBody(body)) continue;
     disposed.add(body);
     debug.enabled && debug.emit({ type: 'dispose', target: body });
-    retireBody(body, null, applied, errors);
+    if (body.committed.length) evictSegs(body.committed.splice(0), null, applied, errors);
     if (body.anchor?.occupant?.body === body) body.anchor.occupant = null;
     body.parent?.children.delete(body);
     if (body.owner?.target === body) releaseOwner(body.owner);
@@ -721,9 +720,15 @@ function inPlace(anchor, seg, prevEnd) {
     : builder.parent(seg.start) === anchor.dest.container(anchor);
 }
 
-const needsPlace = (target, anchor) =>
-  target.anchor !== anchor
-  || (target.committed.length > 0 && (target.committed[0].parked !== null || !inPlace(anchor, target.committed[0], null)));
+function needsPlace(target, anchor) {
+  if (target.anchor !== anchor) return true;
+  let prevEnd = null;
+  for (const seg of target.committed) {
+    if (seg.parked || !inPlace(anchor, seg, prevEnd)) return true;
+    prevEnd = seg.end;
+  }
+  return false;
+}
 
 function parkSegs(target) {
   for (let i = target.committed.length - 1; i >= 0; i--) {
@@ -733,16 +738,7 @@ function parkSegs(target) {
   }
 }
 
-function retireBody(body, liveTargets, applied, errors) {
-  if (!body.committed.length) return;
-  const segs = body.committed;
-  body.committed = [];
-  evictSegs(segs, liveTargets, applied, errors);
-}
-
-function evictSegs(initial, liveTargets, applied, errors = null) {
-  if (!initial.length) return;
-  const segs = initial.slice();
+function evictSegs(segs, liveTargets, applied, errors = null) {
   for (let i = 0; i < segs.length; i++) {
     for (const binding of segs[i].bindings) {
       const occ = binding.occupant;
@@ -751,10 +747,7 @@ function evictSegs(initial, liveTargets, applied, errors = null) {
       noteLeaving(occ, applied);
       if (!occ.body) continue;
       if (liveTargets?.has(occ.body)) parkSegs(occ.body);
-      else {
-        for (const s of occ.body.committed) segs.push(s);
-        occ.body.committed = [];
-      }
+      else if (occ.body.committed.length) segs.push(...occ.body.committed.splice(0));
     }
   }
   for (let i = segs.length - 1; i >= 0; i--) {
@@ -804,7 +797,7 @@ function vacateBinding(binding, occ, nextKind, liveTargets, applied) {
   if (occ.kind === 'instance' && occ.usedHole && nextKind !== 'plain') binding.dest.clear(binding);
   if (!occ.body) return;
   if (liveTargets?.has(occ.body)) parkSegs(occ.body);
-  else retireBody(occ.body, liveTargets, applied);
+  else if (occ.body.committed.length) evictSegs(occ.body.committed.splice(0), liveTargets, applied);
 }
 
 function setOccupant(binding, next, liveTargets, applied) {
@@ -824,35 +817,26 @@ function enqueueCommit(claim, next, applied) {
 }
 
 function reconcileSegments(target, anchor, draft, liveTargets, applied) {
-  const committed = target.committed;
-  const nextList = nextListOf(draft, committed);
-  if (nextList === committed) {
-    if (needsPlace(target, anchor)) placeChain(target, anchor, nextList);
-    return committed;
+  const committed = target.committed, nextList = nextListOf(draft, committed);
+  if (nextList === committed || draft.mode === 'amend') return nextList;
+  const mark = ++PASS;
+  for (const seg of nextList) seg.keepPass = mark;
+  let order = 0;
+  for (const seg of committed) {
+    if (seg.keepPass === mark) { seg.oldIndex = order++; continue; }
+    debug.enabled && debug.emit({ type: 'drop', target, segment: seg });
+    pruneSeg(target, seg);
+    evictSegs([seg], liveTargets, applied);
   }
-
-  if (draft.mode !== 'amend') {
-    const mark = ++PASS;
-    for (const seg of nextList) seg.keepPass = mark;
-    let order = 0;
-    for (const seg of committed) {
-      if (seg.keepPass === mark) { seg.oldIndex = order++; continue; }
-      debug.enabled && debug.emit({ type: 'drop', target, segment: seg });
-      pruneSeg(target, seg);
-      evictSegs([seg], liveTargets, applied);
-    }
-    if (target.anchor === anchor) {
-      const keepMark = markKeepSet(nextList);
-      if (keepMark) {
-        // extract non-LIS moved segments so inPlace() keeps the LIS untouched
-        for (const seg of nextList)
-          if (!seg.parked && seg.keepPass !== keepMark && seg.builder.parent(seg.start))
-            seg.parked = seg.builder.extract(seg.start, seg.end);
-      }
+  if (target.anchor === anchor) {
+    const keepMark = markKeepSet(nextList);
+    if (keepMark) {
+      // extract non-LIS moved segments so inPlace() keeps the LIS untouched
+      for (const seg of nextList)
+        if (!seg.parked && seg.keepPass !== keepMark && seg.builder.parent(seg.start))
+          seg.parked = seg.builder.extract(seg.start, seg.end);
     }
   }
-
-  placeChain(target, anchor, nextList);
   return nextList;
 }
 
@@ -918,10 +902,7 @@ function applyOne(node, byRef, liveTargets, applied) {
   });
   withCause(ev, () => {
     const next = draft ? reconcileSegments(target, anchor, draft, liveTargets, applied) : target.committed;
-    if (moving) {
-      placeChain(target, anchor, next);
-      if (next.length) deliver(target, anchor);
-    }
+    if (draft || moving) placeChain(target, anchor, next);
     if (target.parent && target.parent !== parent) target.parent.children.delete(target);
     target.anchor = anchor;
     target.parent = parent;
@@ -930,7 +911,10 @@ function applyOne(node, byRef, liveTargets, applied) {
       if (incoming.kind === 'instance') incoming.body = target;
       setOccupant(anchor, incoming, null, null);
     }
-    if (!draft) return;
+    if (!draft) {
+      if (moving && next.length) deliver(target, anchor);
+      return;
+    }
     target.committed = next;
     target.rev++;
     if (draft.created) indexCreated(target, draft.created);
