@@ -47,18 +47,27 @@ function stageRefOf(inst, via) {
 /** @type {Mount} */
 export function mount(container, builders) {
   if (!container) throw new Error(`temtie/core: expected container, got ${String(container)}`);
-  if (!builders || typeof builders !== 'object' || typeof builders.compile === 'function' || !Object.keys(builders).length)
-    throw new Error('temtie/core: mount() requires builders, e.g. mount(el, { html })');
+  const names = builders && typeof builders === 'object' && typeof builders.compile !== 'function'
+    ? Object.keys(builders) : [];
+  if (!names.length) throw new Error('temtie/core: mount() requires builders, e.g. mount(el, { html })');
+
+  const proto = {};
+  for (const name of names) {
+    const builder = builders[name];
+    if (typeof builder?.compile !== 'function')
+      throw new TypeError(`temtie/core: builder "${name}" must have compile(strings)`);
+    proto[name] = makeChannel(builder);
+  }
 
   // a mounted root is a regular target seated in a uniform container host
   const host = { dest: DEST[ROOT], node: container, marker: null, builder: null, occupant: null };
-  const target = makeTarget(makeProto(builders));
+  const target = makeTarget(proto);
   const ref = makeRef(target);
   target.owner = ref;
   target.anchor = host;
   host.occupant = target.occ;
 
-  debug.enabled && debug.emit({ type: 'mount', target, container, builders: Object.keys(builders) });
+  debug.enabled && debug.emit({ type: 'mount', target, container, builders: names });
   return ref.inst;
 }
 
@@ -150,16 +159,6 @@ export function reset(inst) {
 export function amend(inst) {
   const ref = stageRefOf(inst, 'amend');
   if (ref.target) beginDraft(ref, 'amend', 'amend');
-}
-
-function makeProto(builders) {
-  const proto = {};
-  for (const [name, builder] of Object.entries(builders)) {
-    if (typeof builder?.compile !== 'function')
-      throw new TypeError(`temtie/core: builder "${name}" must have compile(strings)`);
-    proto[name] = makeChannel(builder);
-  }
-  return proto;
 }
 
 function makeRef(target, spec = null) {
@@ -577,7 +576,7 @@ function disposeBodies(applied, errors) {
     if (body.committed.length) evictSegs(body.committed.splice(0), null, applied, errors);
     if (body.anchor?.occupant?.body === body) body.anchor.occupant = null;
     body.parent?.children.delete(body);
-    if (body.owner?.target === body) releaseOwner(body.owner);
+    if (body.owner) releaseOwner(body.owner);
     body.owner = null;
     body.buckets.clear();
     body.children.clear();
@@ -787,15 +786,19 @@ function deliver(target, anchor) {
   anchor.dest.deliver(anchor);
 }
 
-function vacateBinding(binding, occ, nextKind, liveTargets, applied) {
+function vacateBinding(binding, occ, nextKind, liveTargets, applied, keepBody = null) {
   if (occ.kind === 'plain') {
-    if (nextKind !== 'plain') { occ.prev = UNSET; binding.dest.clear(binding); }
+    if (nextKind !== 'plain') {
+      occ.prev = UNSET;
+      binding.occupant = null;
+      binding.dest.clear(binding);
+    }
     return;
   }
   binding.occupant = null;
   noteLeaving(occ, applied);
-  if (occ.kind === 'instance' && occ.usedHole && nextKind !== 'plain') binding.dest.clear(binding);
-  if (!occ.body) return;
+  if (occ.usedHole && nextKind !== 'plain') binding.dest.clear(binding);
+  if (!occ.body || occ.body === keepBody) return;
   if (liveTargets?.has(occ.body)) parkSegs(occ.body);
   else if (occ.body.committed.length) evictSegs(occ.body.committed.splice(0), liveTargets, applied);
 }
@@ -882,14 +885,8 @@ function applyOne(node, byRef, liveTargets, applied) {
     setTarget(ref, target);
   }
 
-  if (incoming && anchor.occupant !== incoming) {
-    const cur = anchor.occupant;
-    if (cur) {
-      if (cur.body === target) noteLeaving(cur, applied);
-      else vacateBinding(anchor, cur, incoming.kind, liveTargets, applied);
-      anchor.occupant = null;
-    }
-  }
+  if (incoming && anchor.occupant && anchor.occupant !== incoming)
+    vacateBinding(anchor, anchor.occupant, incoming.kind, liveTargets, applied, target);
   if (target.anchor && target.anchor !== anchor) {
     const host = target.anchor;
     if (host.occupant === target.occ) host.occupant = null;
