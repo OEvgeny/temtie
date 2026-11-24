@@ -791,9 +791,23 @@ function planCommit(rootTarget, rootAnchor, rootParent, planPass) {
 function recoverApply(queue, errors, rootTarget, applied) {
   for (const node of queue) if (node.draft) dropDraft(node.draft);
   for (const node of queue) {
+    const t = node.target;
+    if (!node.placed && node.incomingOcc?.kind === 'body'
+      && t.anchor && t.anchor.occupant?.body !== t && node.ownerNode?.placed) {
+      const occ = node.anchor.occupant;
+      if (occ?.kind === 'plain') {
+        const before = errors.length;
+        tryStep(errors, () => vacateBinding(node.anchor, occ, 'body', node.parent, null, applied));
+        if (errors.length === before) node.anchor.occupant = null;
+      }
+      if (!node.anchor.occupant) {
+        t.dirty = true;
+        bindTarget(t, node.anchor, node.parent, node.incomingOcc);
+      }
+    }
     if (node.placed || !node.draft) continue;
     if (node.draft.created) {
-      const owner = liveOwner(node.target, node.parent, rootTarget);
+      const owner = liveOwner(t, node.parent, rootTarget);
       for (const seg of node.draft.created)
         if (!seg.parked && !seg.retired) {
           const before = errors.length;
@@ -802,7 +816,7 @@ function recoverApply(queue, errors, rootTarget, applied) {
           else { (applied.tried ??= new Set()).add(seg); queuePending(owner, seg); }
         }
     }
-    dropOpened(node.target, node.draft.pass, node.draft);
+    dropOpened(t, node.draft.pass, node.draft);
   }
 }
 
@@ -887,19 +901,36 @@ const needsPlace = (target, anchor) =>
   target.dirty || target.anchor !== anchor
   || (target.committed.length > 0 && (target.committed[0].parked !== null || !inPlace(anchor, target.committed[0], null)));
 
-function parkSegs(initial) {
-  if (!initial.length) return;
-  const segs = initial.slice();
+function parkSegs(target) {
+  if (!target.committed.length) return;
+  target.dirty = true;
+  const segs = target.committed.slice();
   for (let i = 0; i < segs.length; i++) {
     for (const binding of segs[i].bindings) {
       const body = binding.occupant?.body;
-      if (body) pushAll(segs, body.committed);
+      if (body?.committed.length) {
+        body.dirty = true;
+        pushAll(segs, body.committed);
+      }
     }
   }
   for (let i = segs.length - 1; i >= 0; i--) {
     const seg = segs[i];
     if (!seg.parked && !seg.retired && seg.builder.parent(seg.start))
       seg.parked = seg.builder.extract(seg.start, seg.end);
+  }
+}
+
+function parkMoving(initial, liveNodes) {
+  if (!liveNodes || !initial.length) return;
+  const scan = initial.slice();
+  for (let i = 0; i < scan.length; i++) {
+    for (const binding of scan[i].bindings) {
+      const body = binding.occupant?.body;
+      if (!body) continue;
+      if (liveNodes.has(body)) parkSegs(body);
+      else pushAll(scan, body.committed);
+    }
   }
 }
 
@@ -941,9 +972,8 @@ function evictSegs(initial, owner, liveNodes, applied, errors) {
       if (!occ) continue;
       binding.occupant = null;
       noteLeaving(occ, applied);
-      if (!occ.body) continue;
-      if (liveNodes?.has(occ.body)) parkSegs(occ.body.committed);
-      else if (liveNodes) pushAll(segs, occ.body.committed);
+      if (!occ.body || liveNodes?.has(occ.body)) continue;
+      if (liveNodes) pushAll(segs, occ.body.committed);
     }
   }
   let i = segs.length - 1;
@@ -972,11 +1002,6 @@ function evictSegs(initial, owner, liveNodes, applied, errors) {
       if (owner) for (let j = i; j >= 0; j--) if (!segs[j].retired) queuePending(owner, segs[j]);
     }
   }
-}
-
-function vacateBody(body, owner, liveNodes, applied) {
-  if (liveNodes.has(body)) parkSegs(body.committed);
-  else evictSegs(body.committed, owner, liveNodes, applied, null);
 }
 
 function placeChain(target, anchor, list) {
@@ -1027,13 +1052,18 @@ function bindTarget(target, anchor, parent, incomingOcc) {
 }
 
 function placeOne(target, anchor, parent, incomingOcc) {
-  if (needsPlace(target, anchor)) {
+  const move = needsPlace(target, anchor);
+  if (incomingOcc?.kind !== 'instance') {
+    if (move) target.dirty = true;
+    bindTarget(target, anchor, parent, incomingOcc);
+  }
+  if (move) {
     settleSpan(target, 'place', 0, () => {
       placeChain(target, anchor, target.committed);
       if (target.committed.length) deliver(target, anchor);
     });
   }
-  bindTarget(target, anchor, parent, incomingOcc);
+  if (incomingOcc?.kind === 'instance') bindTarget(target, anchor, parent, incomingOcc);
 }
 
 function vacateBinding(binding, occ, nextKind, owner, liveNodes, applied) {
@@ -1045,13 +1075,17 @@ function vacateBinding(binding, occ, nextKind, owner, liveNodes, applied) {
     }
     return;
   }
+  if (occ.body) {
+    if (liveNodes?.has(occ.body)) parkSegs(occ.body);
+    else parkMoving(occ.body.committed, liveNodes);
+  }
   binding.occupant = null;
   noteLeaving(occ, applied);
   if (occ.kind === 'instance') {
     if (binding.end) clearRange(binding);
     if (occ.usedHole && nextKind !== 'plain') binding.dest.clear?.(binding);
   }
-  if (occ.body) vacateBody(occ.body, owner, liveNodes, applied);
+  if (occ.body && !liveNodes?.has(occ.body)) evictSegs(occ.body.committed, owner, liveNodes, applied, null);
 }
 
 function reconcileSegments(target, anchor, draft, liveNodes, applied) {
@@ -1065,12 +1099,15 @@ function reconcileSegments(target, anchor, draft, liveNodes, applied) {
   if (draft.mode !== 'amend') {
     const mark = ++PASS;
     for (const seg of nextList) seg.keepPass = mark;
-    let order = 0, dropped = 0, idx = 0;
+    let order = 0, dropped = 0, idx = 0, pruned = false;
     try {
       for (; idx < committed.length; idx++) {
         const seg = committed[idx];
         if (seg.keepPass === mark) { seg.oldIndex = order++; continue; }
+        pruned = false;
+        parkMoving([seg], liveNodes);
         dropped++;
+        pruned = true;
         debug.enabled && debug.emit({ type: 'drop', target, segment: seg });
         pruneSeg(target, seg);
         evictSegs([seg], target, liveNodes, applied, null);
@@ -1079,7 +1116,7 @@ function reconcileSegments(target, anchor, draft, liveNodes, applied) {
       if (dropped) {
         const rem = [];
         for (let j = 0; j < committed.length; j++)
-          if (committed[j].keepPass === mark || j > idx) rem.push(committed[j]);
+          if (committed[j].keepPass === mark || (pruned ? j > idx : j >= idx)) rem.push(committed[j]);
         target.committed = rem;
       }
     }
@@ -1167,8 +1204,12 @@ function applyOne(node, liveNodes, applied) {
   }
 
   settleSpan(target, 'flush', draft.pass, () => {
+    if (incomingOcc?.kind !== 'instance') {
+      if (target.anchor !== anchor) target.dirty = true;
+      bindTarget(target, anchor, parent, incomingOcc);
+    }
     const nextList = reconcileSegments(target, anchor, draft, liveNodes, applied);
-    bindTarget(target, anchor, parent, incomingOcc);
+    if (incomingOcc?.kind === 'instance') bindTarget(target, anchor, parent, incomingOcc);
     target.committed = nextList;
     node.placed = true;
     if (draft.created) indexCreated(target, draft.created);
